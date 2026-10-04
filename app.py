@@ -234,15 +234,35 @@ with st.sidebar:
     names = {i["idSite"]: i.get("name") or f"Instalația {i['idSite']}" for i in insts}
     if is_admin:
         st.caption("ID-uri pentru `sites`: " + ", ".join(f"{n} = {k}" for k, n in names.items()))
+    hide = list(user["hide"])
     if user.get("combined") and len(insts) > 1:
         # vedere combinată: suma tuturor sistemelor, fără nume și fără selecție
         sites = [i["idSite"] for i in insts]
         title = "Total sisteme"
     else:
-        sel = st.selectbox("Instalație", list(names), format_func=names.get) \
-            if len(insts) > 1 else insts[0]["idSite"]
-        sites = [sel]
-        title = names[sel]
+        TOTAL = "__total__"
+        total_name = str(secret("TOTAL_NAME", "Sistem fotovoltaic_Team Montage SRL_PTJ"))
+        options = list(names)
+        if is_admin and len(insts) > 1:
+            options = [TOTAL] + options
+        sel = st.selectbox("Instalație", options,
+                           format_func=lambda k: total_name if k == TOTAL else names[k]) \
+            if len(options) > 1 else options[0]
+        if sel == TOTAL:
+            # opțional: TOTAL_SITES = [..] în Secrets limitează totalul la anumite sisteme
+            # TOTAL_SITES acceptă ID-uri sau numele exacte din VRM
+            wanted = {str(x).strip().lower() for x in (secret("TOTAL_SITES", []) or [])}
+            sites = [k for k in names
+                     if not wanted or str(k) in wanted or names[k].strip().lower() in wanted]
+            if not sites:
+                st.warning("Niciun sistem din TOTAL_SITES nu a fost găsit; afișez toate sistemele.")
+                sites = list(names)
+            title = total_name
+            if "soc" not in hide:
+                hide.append("soc")
+        else:
+            sites = [sel]
+            title = names[sel]
     if is_admin and st.button("🔄 Reîncarcă datele", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
@@ -283,7 +303,7 @@ def live_panel():
              if ts else "")
     st.session_state["_live_debug"] = live
     if str(secret("GAUGE_STYLE", "flow")).lower() == "flow":
-        components.html(flow_html(live, user["hide"], stamp), height=450)
+        components.html(flow_html(live, hide, stamp), height=450)
         return
     gm, bm = gcfg.get("grid_max_w", 10000), gcfg.get("battery_max_w", 5000)
     panels = {
@@ -297,7 +317,7 @@ def live_panel():
                                  "↑ se încarcă", "↓ se descarcă"),
         "soc": lambda: soc_gauge(live["soc"]["value"]),
     }
-    shown = [k for k in panels if k not in user["hide"]]
+    shown = [k for k in panels if k not in hide]
     for col, k in zip(st.columns(max(len(shown), 1)), shown):
         with col:
             panels[k]()
