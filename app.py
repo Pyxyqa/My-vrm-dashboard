@@ -8,8 +8,10 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 import vrm as V
+from flow import flow_html
 from auth import verify_password
 
 st.set_page_config(page_title="Fotovoltaic", page_icon="☀️", layout="wide")
@@ -42,11 +44,29 @@ def expired(u: dict) -> bool:
         return True
 
 
+def user_profile(uname: str, u: dict) -> dict:
+    combined = bool(u.get("combined", False))
+    hide = [str(h).lower() for h in u.get("hide", [])]
+    if combined and "show_soc" not in hide:
+        hide.append("soc")                 # SOC mediu pe mai multe baterii nu are sens
+    return {
+        "username": uname,
+        "name": u.get("name", uname),
+        "role": u.get("role", "guest"),
+        "sites": [int(s) for s in u.get("sites", [])],
+        "combined": combined,
+        "title": u.get("title") or u.get("combined_name") or "",
+        "hide": hide,
+    }
+
+
 def login_gate() -> dict:
     user = st.session_state.get("user")
     if user:
         u = load_users().get(user["username"])
         if u and not expired(u):          # cont șters/expirat între timp -> delogare
+            user = user_profile(user["username"], u)   # preia imediat modificările din Secrets
+            st.session_state["user"] = user
             return user
         st.session_state.pop("user", None)
 
@@ -65,12 +85,7 @@ def login_gate() -> dict:
             u = load_users().get(uname)
             if u and verify_password(password, u.get("password_hash", "")) and not expired(u):
                 st.session_state["fails"] = 0
-                st.session_state["user"] = {
-                    "username": uname,
-                    "name": u.get("name", username),
-                    "role": u.get("role", "guest"),
-                    "sites": [int(s) for s in u.get("sites", [])],
-                }
+                st.session_state["user"] = user_profile(uname, u)
                 st.rerun()
             st.session_state["fails"] = fails + 1
             st.error("Utilizator sau parolă greșită, ori acces expirat.")
@@ -190,7 +205,7 @@ except V.VRMError as e:
 
 if secret("SITE_ID"):
     insts = [i for i in insts if int(i["idSite"]) == int(secret("SITE_ID"))]
-if user["sites"]:
+if user["sites"] or not is_admin:   # oaspeții văd DOAR instalațiile din `sites`
     insts = [i for i in insts if int(i["idSite"]) in user["sites"]]
 if not insts:
     st.warning("Nicio instalație disponibilă pentru acest cont.")
@@ -203,13 +218,23 @@ with st.sidebar:
         st.rerun()
     st.divider()
     names = {i["idSite"]: i.get("name") or f"Instalația {i['idSite']}" for i in insts}
-    site = st.selectbox("Instalație", list(names), format_func=names.get) \
-        if len(insts) > 1 else insts[0]["idSite"]
-    inst = next(i for i in insts if i["idSite"] == site)
+    if is_admin:
+        st.caption("ID-uri pentru `sites`: " + ", ".join(f"{n} = {k}" for k, n in names.items()))
+    if user.get("combined") and len(insts) > 1:
+        # vedere combinată: suma tuturor sistemelor, fără nume și fără selecție
+        sites = [i["idSite"] for i in insts]
+        title = "Total sisteme"
+    else:
+        sel = st.selectbox("Instalație", list(names), format_func=names.get) \
+            if len(insts) > 1 else insts[0]["idSite"]
+        sites = [sel]
+        title = names[sel]
     if is_admin and st.button("🔄 Reîncarcă datele", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
+site = sites[0]
+inst = next(i for i in insts if i["idSite"] == site)
 tz = inst.get("timezone") or secret("TIMEZONE", "Europe/Bucharest")
 try:
     ZoneInfo(tz)
@@ -218,13 +243,13 @@ except Exception:
 now = datetime.now(ZoneInfo(tz))
 if secret("START_YEAR"):
     first_year = int(secret("START_YEAR"))
-elif inst.get("syscreated"):
-    first_year = datetime.fromtimestamp(int(inst["syscreated"]), ZoneInfo(tz)).year
 else:
-    first_year = now.year - 4
+    created = [int(i["syscreated"]) for i in insts if i["idSite"] in sites and i.get("syscreated")]
+    first_year = (datetime.fromtimestamp(min(created), ZoneInfo(tz)).year
+                  if created else now.year - 4)
 first_year = max(2010, min(first_year, now.year))
 
-st.title(f"☀️ {names[site]}")
+st.title(f"☀️ {user['title'] or title}")
 
 # ---------------------------------------------------------------- LIVE
 gcfg = dict(secret("gauges", {}) or {})
@@ -234,29 +259,35 @@ REFRESH = int(secret("REFRESH_SECONDS", 60))
 @st.fragment(run_every=REFRESH)
 def live_panel():
     try:
-        live = V.live_values(diagnostics(site), dict(secret("live_codes", {}) or {}))
+        codes = dict(secret("live_codes", {}) or {})
+        live = V.combine_live([V.live_values(diagnostics(s), codes) for s in sites])
     except V.VRMError as e:
         st.warning(f"Date live indisponibile: {e}")
         return
-    c = st.columns(5)
-    with c[0]:
-        gauge("Producție PV", live["pv"]["value"], 0, gcfg.get("pv_max_w", 10000), "#F2A900")
-    with c[1]:
-        gauge("Consum", live["consumption"]["value"], 0,
-              gcfg.get("consumption_max_w", 10000), "#3B7DD8")
-    with c[2]:
-        m = gcfg.get("grid_max_w", 10000)
-        gauge("Rețea", live["grid"]["value"], -m, m, "#D9534F", "↓ import din rețea", "↑ export în rețea")
-    with c[3]:
-        m = gcfg.get("battery_max_w", 5000)
-        gauge("Baterie", live["battery"]["value"], -m, m, "#7A5AF8", "↑ se încarcă", "↓ se descarcă")
-    with c[4]:
-        soc_gauge(live["soc"]["value"])
     ts = live["_ts"]
-    st.caption(f"Date VRM din {datetime.fromtimestamp(ts.timestamp(), ZoneInfo(tz)):%d.%m.%Y %H:%M:%S}"
-               if ts else "", help=f"Se reîmprospătează automat la {REFRESH} s. VRM primește date "
-                                   "de la GX la intervalul de logare setat pe GX.")
+    stamp = (f"Date VRM din {datetime.fromtimestamp(ts.timestamp(), ZoneInfo(tz)):%d.%m.%Y %H:%M:%S}"
+             if ts else "")
     st.session_state["_live_debug"] = live
+    if str(secret("GAUGE_STYLE", "flow")).lower() == "flow":
+        components.html(flow_html(live, user["hide"], stamp), height=450)
+        return
+    gm, bm = gcfg.get("grid_max_w", 10000), gcfg.get("battery_max_w", 5000)
+    panels = {
+        "pv": lambda: gauge("Producție PV", live["pv"]["value"], 0,
+                            gcfg.get("pv_max_w", 10000), "#F2A900"),
+        "consumption": lambda: gauge("Consum", live["consumption"]["value"], 0,
+                                     gcfg.get("consumption_max_w", 10000), "#3B7DD8"),
+        "grid": lambda: gauge("Rețea", live["grid"]["value"], -gm, gm, "#D9534F",
+                              "↓ import din rețea", "↑ export în rețea"),
+        "battery": lambda: gauge("Baterie", live["battery"]["value"], -bm, bm, "#7A5AF8",
+                                 "↑ se încarcă", "↓ se descarcă"),
+        "soc": lambda: soc_gauge(live["soc"]["value"]),
+    }
+    shown = [k for k in panels if k not in user["hide"]]
+    for col, k in zip(st.columns(max(len(shown), 1)), shown):
+        with col:
+            panels[k]()
+    st.caption(stamp, help=f"Se reîmprospătează automat la {REFRESH} s.")
 
 
 live_panel()
@@ -264,7 +295,8 @@ live_panel()
 # ---------------------------------------------------------------- ENERGIE
 try:
     with st.spinner("Încarc istoricul de energie din VRM…"):
-        flows = flows_all(site, first_year, tz)
+        # mai multe sisteme: fluxurile se concatenează, iar gruparea pe zi/lună/an le însumează
+        flows = pd.concat([flows_all(s, first_year, tz) for s in sites]).sort_index()
 except V.VRMError as e:
     st.error(str(e))
     st.stop()
