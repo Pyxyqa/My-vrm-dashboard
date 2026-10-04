@@ -155,9 +155,20 @@ def _is_system(r: dict) -> bool:
             or str(r.get("Device") or r.get("device") or "").lower() == "system overview")
 
 
-def live_values(records: list[dict], code_overrides: dict | None = None) -> dict:
+def live_values(records: list[dict], code_overrides: dict | None = None,
+                stale_s: int = 1800) -> dict:
     """Întoarce {cheie: {"value": float|None, "matched": [descrieri]}} + "_ts"."""
     code_overrides = code_overrides or {}
+    # VRM păstrează ultima valoare a unui dispozitiv care nu mai trimite date (ex. invertorul
+    # PV noaptea). Ignorăm valorile mult mai vechi decât cele mai noi date ale instalației.
+    all_ts = [r.get("timestamp") for r in records if isinstance(r.get("timestamp"), (int, float))]
+    newest = max(all_ts) if all_ts else None
+    stale_keys: set = set()
+
+    def fresh(r):
+        t = r.get("timestamp")
+        return newest is None or not isinstance(t, (int, float)) or t >= newest - stale_s
+
     system = [r for r in records if _is_system(r)]
     out: dict = {}
     for key, rule in LIVE_RULES.items():
@@ -175,17 +186,22 @@ def live_values(records: list[dict], code_overrides: dict | None = None) -> dict
                                    for p in rule["desc"])]
                 if hits:
                     break
-        vals = [v for v in (_num(r.get("rawValue")) for r in hits) if v is not None]
+        live_hits = [r for r in hits if fresh(r)]
+        if hits and not live_hits:
+            stale_keys.add(key)
+        hits_used = live_hits
+        vals = [v for v in (_num(r.get("rawValue")) for r in hits_used) if v is not None]
         if not vals:
-            value = None
+            # PV fără date recente = invertor oprit (noapte) -> 0 W
+            value = 0.0 if key == "pv" and key in stale_keys else None
         elif rule["mode"] == "sum":
             value = sum(vals)
         else:
             value = vals[0]
         out[key] = {"value": value,
-                    "matched": [f'{r.get("Device")}: {r.get("description")} [{r.get("code")}]' for r in hits]}
-    ts = [r.get("timestamp") for r in records if isinstance(r.get("timestamp"), (int, float))]
-    out["_ts"] = datetime.fromtimestamp(max(ts)) if ts else None
+                    "matched": [f'{r.get("Device")}: {r.get("description")} [{r.get("code")}]'
+                                + ("" if fresh(r) else " (date vechi, ignorat)") for r in hits]}
+    out["_ts"] = datetime.fromtimestamp(newest) if newest else None
     return out
 
 

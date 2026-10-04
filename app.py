@@ -257,6 +257,7 @@ with st.sidebar:
             if not sites:
                 st.warning("Niciun sistem din TOTAL_SITES nu a fost găsit; afișez toate sistemele.")
                 sites = list(names)
+            st.caption("**Incluse în total:**  \n" + "  \n".join(f"• {names[k]}" for k in sites))
             title = total_name
             if "soc" not in hide:
                 hide.append("soc")
@@ -288,8 +289,8 @@ st.title(f"☀️ {user['title'] or title}")
 # ---------------------------------------------------------------- LIVE
 gcfg = dict(secret("gauges", {}) or {})
 REFRESH = int(secret("REFRESH_SECONDS", 60))
-TOTAL_NAME = "Sistem fotovoltaic_Team Montage SRL_PTJ"
-TOTAL_SITES = ["Team Montage_Tranzitie Justa_Subsistem 1", "Team Montage_Tranzitie Justa_Subsistem 2"]
+
+
 @st.fragment(run_every=REFRESH)
 def live_panel():
     try:
