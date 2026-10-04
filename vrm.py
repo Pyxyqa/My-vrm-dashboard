@@ -187,3 +187,23 @@ def live_values(records: list[dict], code_overrides: dict | None = None) -> dict
     ts = [r.get("timestamp") for r in records if isinstance(r.get("timestamp"), (int, float))]
     out["_ts"] = datetime.fromtimestamp(max(ts)) if ts else None
     return out
+
+
+def combine_live(lives: list[dict]) -> dict:
+    """Însumează valorile live ale mai multor sisteme (SOC = media)."""
+    if len(lives) == 1:
+        return lives[0]
+    out: dict = {}
+    for key, rule in LIVE_RULES.items():
+        vals = [lv[key]["value"] for lv in lives if lv[key]["value"] is not None]
+        if not vals:
+            value = None
+        elif key == "soc":
+            value = sum(vals) / len(vals)
+        else:
+            value = sum(vals)
+        out[key] = {"value": value,
+                    "matched": [m for lv in lives for m in lv[key]["matched"]]}
+    tss = [lv["_ts"] for lv in lives if lv["_ts"]]
+    out["_ts"] = min(tss) if tss else None   # cea mai veche = cât de proaspăt e totalul
+    return out
