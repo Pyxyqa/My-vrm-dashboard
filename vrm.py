@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import time
 from datetime import datetime
 
 import pandas as pd
@@ -156,7 +157,7 @@ def _is_system(r: dict) -> bool:
 
 
 def live_values(records: list[dict], code_overrides: dict | None = None,
-                stale_s: int = 1800) -> dict:
+                stale_s: int = 1800, offline_s: int = 7200, now: float | None = None) -> dict:
     """Întoarce {cheie: {"value": float|None, "matched": [descrieri]}} + "_ts"."""
     code_overrides = code_overrides or {}
     # VRM păstrează ultima valoare a unui dispozitiv care nu mai trimite date (ex. invertorul
@@ -165,9 +166,16 @@ def live_values(records: list[dict], code_overrides: dict | None = None,
     newest = max(all_ts) if all_ts else None
     stale_keys: set = set()
 
+    now = time.time() if now is None else now
+    # instalație care nu a mai trimis nimic de mult (GX offline / fără internet):
+    # toate valorile ei sunt vechi și nu trebuie afișate sau adunate în total
+    offline = newest is None or newest < now - offline_s
+
     def fresh(r):
+        if offline:
+            return False
         t = r.get("timestamp")
-        return newest is None or not isinstance(t, (int, float)) or t >= newest - stale_s
+        return not isinstance(t, (int, float)) or t >= newest - stale_s
 
     system = [r for r in records if _is_system(r)]
     out: dict = {}
@@ -202,6 +210,7 @@ def live_values(records: list[dict], code_overrides: dict | None = None,
                     "matched": [f'{r.get("Device")}: {r.get("description")} [{r.get("code")}]'
                                 + ("" if fresh(r) else " (date vechi, ignorat)") for r in hits]}
     out["_ts"] = datetime.fromtimestamp(newest) if newest else None
+    out["_offline"] = offline
     return out
 
 
@@ -220,6 +229,9 @@ def combine_live(lives: list[dict]) -> dict:
             value = sum(vals)
         out[key] = {"value": value,
                     "matched": [m for lv in lives for m in lv[key]["matched"]]}
-    tss = [lv["_ts"] for lv in lives if lv["_ts"]]
-    out["_ts"] = min(tss) if tss else None   # cea mai veche = cât de proaspăt e totalul
+    online = [lv for lv in lives if not lv.get("_offline")]
+    tss = [lv["_ts"] for lv in online if lv["_ts"]]
+    out["_ts"] = min(tss) if tss else None   # cea mai veche dintre sistemele online
+    out["_offline"] = not online
+    out["_offline_count"] = len(lives) - len(online)
     return out
