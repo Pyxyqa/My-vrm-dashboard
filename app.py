@@ -288,8 +288,8 @@ st.title(f"☀️ {user['title'] or title}")
 # ---------------------------------------------------------------- LIVE
 gcfg = dict(secret("gauges", {}) or {})
 REFRESH = int(secret("REFRESH_SECONDS", 60))
-
-
+TOTAL_NAME = "Sistem fotovoltaic_Team Montage SRL_PTJ"
+TOTAL_SITES = ["Team Montage_Tranzitie Justa_Subsistem 1", "Team Montage_Tranzitie Justa_Subsistem 2"]
 @st.fragment(run_every=REFRESH)
 def live_panel():
     try:
