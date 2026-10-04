@@ -12,7 +12,21 @@ import streamlit.components.v1 as components
 
 import vrm as V
 from flow import flow_html
-from auth import verify_password
+import base64
+import hashlib
+import hmac
+
+
+def verify_password(password: str, stored: str) -> bool:
+    """Verifică o parolă față de un hash PBKDF2-SHA256 generat cu make_hash.py."""
+    try:
+        algo, it, salt_b64, hash_b64 = stored.split("$")
+        if algo != "pbkdf2_sha256":
+            return False
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode(), base64.b64decode(salt_b64), int(it))
+        return hmac.compare_digest(dk, base64.b64decode(hash_b64))
+    except Exception:
+        return False
 
 st.set_page_config(page_title="Fotovoltaic", page_icon="☀️", layout="wide")
 
