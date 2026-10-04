@@ -43,6 +43,19 @@ def secret(key, default=None):
         return default
 
 
+def find_secret(key, default=None):
+    """Caută o cheie în Secrets la primul nivel sau în orice secțiune."""
+    try:
+        if key in st.secrets:
+            return st.secrets[key]
+        for v in st.secrets.values():
+            if hasattr(v, "keys") and key in v:
+                return v[key]
+    except Exception:
+        pass
+    return default
+
+
 # ================================================================ AUTENTIFICARE
 def load_users() -> dict:
     return {k.lower(): dict(v) for k, v in (secret("users", {}) or {}).items()}
@@ -241,7 +254,7 @@ with st.sidebar:
         title = "Total sisteme"
     else:
         TOTAL = "__total__"
-        total_name = str(secret("TOTAL_NAME", "Sistem fotovoltaic_Team Montage SRL_PTJ"))
+        total_name = str(find_secret("TOTAL_NAME", "Sistem fotovoltaic_Team Montage SRL_PTJ"))
         options = list(names)
         if is_admin and len(insts) > 1:
             options = [TOTAL] + options
@@ -249,15 +262,25 @@ with st.sidebar:
                            format_func=lambda k: total_name if k == TOTAL else names[k]) \
             if len(options) > 1 else options[0]
         if sel == TOTAL:
-            # opțional: TOTAL_SITES = [..] în Secrets limitează totalul la anumite sisteme
-            # TOTAL_SITES acceptă ID-uri sau numele exacte din VRM
-            wanted = {str(x).strip().lower() for x in (secret("TOTAL_SITES", []) or [])}
-            sites = [k for k in names
-                     if not wanted or str(k) in wanted or names[k].strip().lower() in wanted]
+            # TOTAL_SITES (ID-uri sau nume exacte) e căutat oriunde în Secrets,
+            # chiar dacă a ajuns din greșeală sub o secțiune [..]
+            raw = find_secret("TOTAL_SITES") or []
+            wanted = {str(x).strip().lower() for x in raw}
+            default = [k for k in names
+                       if str(k) in wanted or names[k].strip().lower() in wanted]
+            if not default:
+                if wanted:
+                    st.warning("Numele/ID-urile din TOTAL_SITES nu se potrivesc cu sistemele din VRM.")
+                default = list(names)
+            sites = st.multiselect("Sisteme incluse în total", list(names), default=default,
+                                   format_func=names.get, key="total_sites")
             if not sites:
-                st.warning("Niciun sistem din TOTAL_SITES nu a fost găsit; afișez toate sistemele.")
-                sites = list(names)
-            st.caption("**Incluse în total:**  \n" + "  \n".join(f"• {names[k]}" for k in sites))
+                st.info("Alege cel puțin un sistem.")
+                st.stop()
+            if is_admin and set(sites) != set(default):
+                st.caption("Ca alegerea să rămână salvată, pune linia de mai jos în Secrets, "
+                           "**deasupra** primei linii care începe cu `[`:")
+                st.code("TOTAL_SITES = [" + ", ".join(str(k) for k in sites) + "]", language="toml")
             title = total_name
             if "soc" not in hide:
                 hide.append("soc")
@@ -302,6 +325,10 @@ def live_panel():
     ts = live["_ts"]
     stamp = (f"Date VRM din {datetime.fromtimestamp(ts.timestamp(), ZoneInfo(tz)):%d.%m.%Y %H:%M:%S}"
              if ts else "")
+    if live.get("_offline"):
+        stamp = "⚠️ Instalația nu a mai trimis date în ultimele 2 ore (GX offline?)"
+    elif live.get("_offline_count"):
+        stamp += f" · {live['_offline_count']} sistem(e) fără date recente, excluse din total"
     st.session_state["_live_debug"] = live
     if str(secret("GAUGE_STYLE", "flow")).lower() == "flow":
         components.html(flow_html(live, hide, stamp), height=450)
