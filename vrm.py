@@ -60,7 +60,9 @@ class VRM:
 #   Pc PV->consumatori  Pb PV->baterie  Pg PV->rețea
 #   Gc rețea->consumatori  Gb rețea->baterie
 #   Bc baterie->consumatori  Bg baterie->rețea
-FLOW_CODES = ["Pc", "Pb", "Pg", "Gc", "Gb", "Bc", "Bg"]
+# Px / Bx: energie PV / baterie spre rețea „mascată” prin corecții (export afișat 0),
+# păstrată în producție / descărcare baterie. VRM nu întoarce aceste coduri.
+FLOW_CODES = ["Pc", "Pb", "Pg", "Gc", "Gb", "Bc", "Bg", "Px", "Bx"]
 
 
 def flows_df(payload: dict, tz: str) -> pd.DataFrame:
@@ -107,17 +109,48 @@ def group_flows(flows: pd.DataFrame, freq: str) -> pd.DataFrame:
 def summarize(f: pd.DataFrame) -> pd.DataFrame:
     """Mărimi derivate din fluxuri (kWh și %)."""
     out = pd.DataFrame(index=f.index)
-    prod = f.Pc + f.Pb + f.Pg
+    prod = f.Pc + f.Pb + f.Pg + f.Px
     cons = f.Pc + f.Gc + f.Bc
     out["Producție PV"] = prod
     out["Consum"] = cons
     out["Import rețea"] = f.Gc + f.Gb
     out["Export rețea"] = f.Pg + f.Bg
     out["Încărcare baterie"] = f.Pb + f.Gb
-    out["Descărcare baterie"] = f.Bc + f.Bg
+    out["Descărcare baterie"] = f.Bc + f.Bg + f.Bx
     out["Autoconsum %"] = ((f.Pc + f.Pb) / prod.where(prod > 0) * 100).fillna(0.0)
     out["Autonomie %"] = ((f.Pc + f.Bc) / cons.where(cons > 0) * 100).fillna(0.0)
     return out
+
+
+def apply_corrections(flows: pd.DataFrame, corrections, site: int, site_name: str = "") -> pd.DataFrame:
+    """Aplică corecțiile din Secrets ([[corrections]]) pe fluxurile zilnice ale unui sistem.
+
+    Suportat: metric = "export" -> exportul în rețea devine 0 în perioada dată
+    (producția PV și descărcarea bateriei rămân cele reale).
+    Câmpuri: metric, from, to (AAAA-LL-ZZ, inclusiv), sites (opțional: ID-uri sau nume).
+    """
+    if flows.empty or not corrections:
+        return flows
+    f = flows.copy()
+    days = f.index.tz_localize(None).normalize()
+    for c in corrections:
+        c = dict(c)
+        if str(c.get("metric", "")).lower() != "export":
+            continue
+        only = {str(x).strip().lower() for x in c.get("sites", [])}
+        if only and str(site) not in only and site_name.strip().lower() not in only:
+            continue
+        try:
+            start = pd.Timestamp(str(c["from"])[:10])
+            end = pd.Timestamp(str(c["to"])[:10])
+        except (KeyError, ValueError):
+            continue
+        m = (days >= start) & (days <= end)
+        f.loc[m, "Px"] += f.loc[m, "Pg"]
+        f.loc[m, "Pg"] = 0.0
+        f.loc[m, "Bx"] += f.loc[m, "Bg"]
+        f.loc[m, "Bg"] = 0.0
+    return f
 
 
 def with_total(f: pd.DataFrame, labels: list[str]) -> pd.DataFrame:

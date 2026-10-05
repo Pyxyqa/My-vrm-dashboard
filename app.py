@@ -358,7 +358,9 @@ live_panel()
 try:
     with st.spinner("Încarc istoricul de energie din VRM…"):
         # mai multe sisteme: fluxurile se concatenează, iar gruparea pe zi/lună/an le însumează
-        flows = pd.concat([flows_all(s, first_year, tz) for s in sites]).sort_index()
+        corr = find_secret("corrections") or []
+        flows = pd.concat([V.apply_corrections(flows_all(s, first_year, tz), corr, s, names[s])
+                           for s in sites]).sort_index()
 except V.VRMError as e:
     st.error(str(e))
     st.stop()
@@ -422,7 +424,7 @@ if t_diag:
         st.markdown("**Ce valori s-au folosit pentru ceasuri**")
         dbg = st.session_state.get("_live_debug", {})
         for k, v in dbg.items():
-            if k != "_ts":
+            if not k.startswith("_"):
                 st.write(f"`{k}` → {v['value']}  ·  {', '.join(v['matched']) or '— nimic găsit —'}")
         st.caption("Dacă un ceas e greșit, alege codurile corecte din tabelul de mai jos și pune-le "
                    "în Secrets la [live_codes], ex.: pv = [\"Pdc\"].")
