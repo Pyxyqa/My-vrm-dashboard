@@ -74,6 +74,7 @@ def expired(u: dict) -> bool:
 def user_profile(uname: str, u: dict) -> dict:
     combined = bool(u.get("combined", False))
     hide = [str(h).lower() for h in u.get("hide", [])]
+    hide_base = list(hide)
     if combined and "show_soc" not in hide:
         hide.append("soc")                 # SOC mediu pe mai multe baterii nu are sens
     return {
@@ -84,6 +85,10 @@ def user_profile(uname: str, u: dict) -> dict:
         "combined": combined,
         "title": u.get("title") or u.get("combined_name") or "",
         "hide": hide,
+        "hide_base": hide_base,
+        # sisteme afișate separat SUB vederea principală (nu intră în total)
+        "extra_sites": [dict(x) if hasattr(x, "keys") else str(x)
+                        for x in u.get("extra_sites", [])],
     }
 
 
@@ -195,7 +200,7 @@ def soc_gauge(soc):
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
 
-def energy_chart(table: pd.DataFrame, title: str):
+def energy_chart(table: pd.DataFrame, title: str, key: str | None = None):
     t = table.drop(index="TOTAL", errors="ignore")
     fig = go.Figure()
     for col in ["Producție PV", "Consum", "Import rețea", "Export rețea"]:
@@ -204,16 +209,16 @@ def energy_chart(table: pd.DataFrame, title: str):
     fig.update_layout(barmode="group", title=title, height=380, yaxis_title="kWh",
                       legend=dict(orientation="h", y=-0.2), margin=dict(l=10, r=10, t=50, b=10),
                       hovermode="x unified")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key=key)
 
 
-def energy_table(table: pd.DataFrame, fname: str):
+def energy_table(table: pd.DataFrame, fname: str, key: str | None = None):
     cfg = {c: st.column_config.NumberColumn(c, format="%.0f %%") if c.endswith("%")
            else st.column_config.NumberColumn(c + " (kWh)", format="%.2f")
            for c in table.columns}
     st.dataframe(table, column_config=cfg, use_container_width=True)
     st.download_button("⬇️ Descarcă CSV", table.to_csv(sep=";", decimal=",").encode("utf-8-sig"),
-                       file_name=fname, mime="text/csv")
+                       file_name=fname, mime="text/csv", key=key)
 
 
 # ================================================================ PAGINA
@@ -226,6 +231,7 @@ if not secret("VRM_TOKEN"):
 
 try:
     insts = installations()
+    all_insts = list(insts)
 except V.VRMError as e:
     st.error(str(e))
     st.stop()
@@ -291,34 +297,26 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-site = sites[0]
-inst = next(i for i in insts if i["idSite"] == site)
-tz = inst.get("timezone") or secret("TIMEZONE", "Europe/Bucharest")
-try:
-    ZoneInfo(tz)
-except Exception:
-    tz = "Europe/Bucharest"
-now = datetime.now(ZoneInfo(tz))
-if secret("START_YEAR"):
-    first_year = int(secret("START_YEAR"))
-else:
-    created = [int(i["syscreated"]) for i in insts if i["idSite"] in sites and i.get("syscreated")]
-    first_year = (datetime.fromtimestamp(min(created), ZoneInfo(tz)).year
-                  if created else now.year - 4)
-first_year = max(2010, min(first_year, now.year))
-
-st.title(f"☀️ {user['title'] or title}")
-
-# ---------------------------------------------------------------- LIVE
 gcfg = dict(secret("gauges", {}) or {})
 REFRESH = int(secret("REFRESH_SECONDS", 60))
+all_names = {i["idSite"]: i.get("name") or f"Instalația {i['idSite']}" for i in all_insts}
+
+
+def site_tz(sec_sites):
+    inst = next(i for i in all_insts if i["idSite"] == sec_sites[0])
+    tz = inst.get("timezone") or secret("TIMEZONE", "Europe/Bucharest")
+    try:
+        ZoneInfo(tz)
+    except Exception:
+        tz = "Europe/Bucharest"
+    return tz
 
 
 @st.fragment(run_every=REFRESH)
-def live_panel():
+def live_panel(sec_sites, sec_hide, tz, key):
     try:
         codes = dict(secret("live_codes", {}) or {})
-        live = V.combine_live([V.live_values(diagnostics(s), codes) for s in sites])
+        live = V.combine_live([V.live_values(diagnostics(s), codes) for s in sec_sites])
     except V.VRMError as e:
         st.warning(f"Date live indisponibile: {e}")
         return
@@ -329,9 +327,9 @@ def live_panel():
         stamp = "⚠️ Instalația nu a mai trimis date în ultimele 2 ore (GX offline?)"
     elif live.get("_offline_count"):
         stamp += f" · {live['_offline_count']} sistem(e) fără date recente, excluse din total"
-    st.session_state["_live_debug"] = live
+    st.session_state["_live_debug_" + key] = live
     if str(secret("GAUGE_STYLE", "flow")).lower() == "flow":
-        components.html(flow_html(live, hide, stamp), height=450)
+        components.html(flow_html(live, sec_hide, stamp), height=450)
         return
     gm, bm = gcfg.get("grid_max_w", 10000), gcfg.get("battery_max_w", 5000)
     panels = {
@@ -345,104 +343,149 @@ def live_panel():
                                  "↑ se încarcă", "↓ se descarcă"),
         "soc": lambda: soc_gauge(live["soc"]["value"]),
     }
-    shown = [k for k in panels if k not in hide]
+    shown = [k for k in panels if k not in sec_hide]
     for col, k in zip(st.columns(max(len(shown), 1)), shown):
         with col:
             panels[k]()
     st.caption(stamp, help=f"Se reîmprospătează automat la {REFRESH} s.")
 
 
-live_panel()
+def render_section(sec_sites, sec_title, sec_hide, key, show_diag=False):
+    """Un dashboard complet (flux live + KPI + tabele) pentru unul sau mai multe sisteme."""
+    tz = site_tz(sec_sites)
+    now = datetime.now(ZoneInfo(tz))
+    if secret("START_YEAR"):
+        first_year = int(secret("START_YEAR"))
+    else:
+        created = [int(i["syscreated"]) for i in all_insts
+                   if i["idSite"] in sec_sites and i.get("syscreated")]
+        first_year = (datetime.fromtimestamp(min(created), ZoneInfo(tz)).year
+                      if created else now.year - 4)
+    first_year = max(2010, min(first_year, now.year))
 
-# ---------------------------------------------------------------- ENERGIE
-try:
-    with st.spinner("Încarc istoricul de energie din VRM…"):
-        # mai multe sisteme: fluxurile se concatenează, iar gruparea pe zi/lună/an le însumează
-        corr = find_secret("corrections") or []
-        flows = pd.concat([V.apply_corrections(flows_all(s, first_year, tz), corr, s, names[s])
-                           for s in sites]).sort_index()
-except V.VRMError as e:
-    st.error(str(e))
-    st.stop()
+    st.title(f"☀️ {sec_title}")
+    live_panel(sec_sites, sec_hide, tz, key)
 
-daily = V.group_flows(flows, "D")
-if daily.empty:
-    st.info("VRM nu a întors date de energie pentru această instalație.")
-    st.stop()
+    try:
+        with st.spinner("Încarc istoricul de energie din VRM…"):
+            corr = [dict(c) for c in (find_secret("corrections") or [])]
+            flows = pd.concat([V.apply_corrections(flows_all(s, first_year, tz), corr, s,
+                                                   all_names.get(s, ""))
+                               for s in sec_sites]).sort_index()
+    except V.VRMError as e:
+        st.error(str(e))
+        return
 
-# KPI-uri
-def _sum(mask):
-    s = V.summarize(daily[mask].sum().to_frame().T).iloc[0]
-    return s
+    if is_admin and key == "main":
+        if corr:
+            st.caption("Corecții aplicate: " + "; ".join(
+                f"{c.get('metric')} = 0 între {c.get('from')} și {c.get('to')}"
+                + (f" (sisteme: {', '.join(str(x) for x in c.get('sites', []))})"
+                   if c.get("sites") else "")
+                for c in corr))
+        else:
+            st.caption("Nicio corecție găsită în Secrets.")
+
+    daily = V.group_flows(flows, "D")
+    if daily.empty:
+        st.info("VRM nu a întors date de energie pentru această instalație.")
+        return
+
+    def _sum(mask):
+        return V.summarize(daily[mask].sum().to_frame().T).iloc[0]
+
+    idx = daily.index
+    periods = {
+        "Azi": idx == pd.Timestamp(now.date()),
+        LUNI[now.month - 1]: (idx.year == now.year) & (idx.month == now.month),
+        str(now.year): idx.year == now.year,
+        "Total": idx == idx,
+    }
+    st.subheader("Energie")
+    for col, (label, mask) in zip(st.columns(len(periods)), periods.items()):
+        s = _sum(mask)
+        with col:
+            st.metric(f"{label} · producție", f"{s['Producție PV']:,.1f} kWh".replace(",", " "))
+            st.caption(f"Consum {s['Consum']:,.1f} · import {s['Import rețea']:,.1f} · "
+                       f"export {s['Export rețea']:,.1f} kWh".replace(",", " "))
+
+    tabs = ["📅 Zilnic", "🗓️ Lunar", "📈 Anual"] + (["🔧 Diagnostic"] if show_diag else [])
+    t_day, t_month, t_year, *t_diag = st.tabs(tabs)
+    years = sorted(set(idx.year), reverse=True)
+    fn = "" if key == "main" else f"_{key}"
+
+    with t_day:
+        a, b = st.columns(2)
+        y = a.selectbox("An", years, key=f"d_y_{key}")
+        months = sorted(set(idx[idx.year == y].month), reverse=True)
+        m = b.selectbox("Lună", months, format_func=lambda k: LUNI[k - 1], key=f"d_m_{key}")
+        sel = daily[(idx.year == y) & (idx.month == m)]
+        table = V.with_total(sel, [d.strftime("%d.%m.%Y") for d in sel.index])
+        energy_chart(table.rename(index=lambda s: s[:5]), f"{LUNI[m - 1]} {y}", key=f"c_d_{key}")
+        energy_table(table, f"energie_zilnic{fn}_{y}-{m:02d}.csv", key=f"dl_d_{key}")
+
+    with t_month:
+        y = st.selectbox("An", years, key=f"m_y_{key}")
+        mon = V.group_flows(flows[flows.index.year == y], "M")
+        table = V.with_total(mon, [LUNI[d.month - 1] for d in mon.index])
+        energy_chart(table, f"Pe luni – {y}", key=f"c_m_{key}")
+        energy_table(table, f"energie_lunar{fn}_{y}.csv", key=f"dl_m_{key}")
+
+    with t_year:
+        yr = V.group_flows(flows, "Y")
+        table = V.with_total(yr, [str(d.year) for d in yr.index])
+        energy_chart(table, "Pe ani", key=f"c_y_{key}")
+        energy_table(table, f"energie_anual{fn}.csv", key=f"dl_y_{key}")
+
+    if t_diag:
+        with t_diag[0]:
+            st.markdown("**Ce valori s-au folosit pentru diagrama live**")
+            dbg = st.session_state.get("_live_debug_" + key, {})
+            for k, v in dbg.items():
+                if not k.startswith("_"):
+                    st.write(f"`{k}` → {v['value']}  ·  "
+                             f"{', '.join(v['matched']) or '— nimic găsit —'}")
+            st.caption("Dacă o valoare e greșită, alege codurile corecte din tabelul de mai jos și "
+                       "pune-le în Secrets la [live_codes], ex.: pv = [\"Pdc\"].")
+            try:
+                df = pd.DataFrame(diagnostics(sec_sites[0]))
+                keep = [c for c in ["Device", "instance", "description", "code", "formattedValue",
+                                    "rawValue", "dbusServiceType", "dbusPath", "idDataAttribute"]
+                        if c in df]
+                st.dataframe(df[keep], use_container_width=True, height=500)
+            except V.VRMError as e:
+                st.error(str(e))
+            st.markdown(f"**Fus orar:** {tz} · **Istoric din:** {first_year} · "
+                        f"**Zile cu date:** {len(daily)}")
+            st.markdown("**Utilizatori configurați**")
+            st.dataframe(pd.DataFrame([{"utilizator": k, "nume": u.get("name", ""),
+                                        "rol": u.get("role", "guest"),
+                                        "expiră": str(u.get("expires", "")),
+                                        "activ": not expired(u)}
+                                       for k, u in load_users().items()]),
+                         use_container_width=True, hide_index=True)
 
 
-idx = daily.index
-periods = {
-    "Azi": idx == pd.Timestamp(now.date()),
-    LUNI[now.month - 1]: (idx.year == now.year) & (idx.month == now.month),
-    str(now.year): idx.year == now.year,
-    "Total": idx == idx,
-}
-st.subheader("Energie")
-cols = st.columns(len(periods))
-for col, (label, mask) in zip(cols, periods.items()):
-    s = _sum(mask)
-    with col:
-        st.metric(f"{label} · producție", f"{s['Producție PV']:,.1f} kWh".replace(",", " "))
-        st.caption(f"Consum {s['Consum']:,.1f} · import {s['Import rețea']:,.1f} · "
-                   f"export {s['Export rețea']:,.1f} kWh".replace(",", " "))
+def resolve_sites(keys) -> list:
+    """ID-uri sau nume exacte -> idSite din contul VRM."""
+    wanted = {str(x).strip().lower() for x in keys}
+    return [i["idSite"] for i in all_insts
+            if str(i["idSite"]) in wanted or str(i.get("name", "")).strip().lower() in wanted]
 
-tabs = ["📅 Zilnic", "🗓️ Lunar", "📈 Anual"] + (["🔧 Diagnostic"] if is_admin else [])
-t_day, t_month, t_year, *t_diag = st.tabs(tabs)
-years = sorted(set(idx.year), reverse=True)
 
-with t_day:
-    a, b = st.columns(2)
-    y = a.selectbox("An", years, key="d_y")
-    months = sorted(set(idx[idx.year == y].month), reverse=True)
-    m = b.selectbox("Lună", months, format_func=lambda k: LUNI[k - 1], key="d_m")
-    sel = daily[(idx.year == y) & (idx.month == m)]
-    table = V.with_total(sel, [d.strftime("%d.%m.%Y") for d in sel.index])
-    energy_chart(table.rename(index=lambda s: s[:5]), f"{LUNI[m - 1]} {y}")
-    energy_table(table, f"energie_zilnic_{y}-{m:02d}.csv")
+# ---------------------------------------------------------------- PAGINA
+render_section(sites, user["title"] or title, hide, "main", show_diag=is_admin)
 
-with t_month:
-    y = st.selectbox("An", years, key="m_y")
-    mon = V.group_flows(flows[flows.index.year == y], "M")
-    table = V.with_total(mon, [LUNI[d.month - 1] for d in mon.index])
-    energy_chart(table, f"Pe luni – {y}")
-    energy_table(table, f"energie_lunar_{y}.csv")
-
-with t_year:
-    yr = V.group_flows(flows, "Y")
-    table = V.with_total(yr, [str(d.year) for d in yr.index])
-    energy_chart(table, "Pe ani")
-    energy_table(table, "energie_anual.csv")
-
-if t_diag:
-    with t_diag[0]:
-        st.markdown("**Ce valori s-au folosit pentru ceasuri**")
-        dbg = st.session_state.get("_live_debug", {})
-        for k, v in dbg.items():
-            if not k.startswith("_"):
-                st.write(f"`{k}` → {v['value']}  ·  {', '.join(v['matched']) or '— nimic găsit —'}")
-        st.caption("Dacă un ceas e greșit, alege codurile corecte din tabelul de mai jos și pune-le "
-                   "în Secrets la [live_codes], ex.: pv = [\"Pdc\"].")
-        try:
-            recs = diagnostics(site)
-            df = pd.DataFrame(recs)
-            keep = [c for c in ["Device", "instance", "description", "code", "formattedValue",
-                                "rawValue", "dbusServiceType", "dbusPath", "idDataAttribute"]
-                    if c in df]
-            st.dataframe(df[keep], use_container_width=True, height=500)
-        except V.VRMError as e:
-            st.error(str(e))
-        st.markdown(f"**Fus orar:** {tz} · **Istoric din:** {first_year} · "
-                    f"**Zile cu date:** {len(daily)}")
-        st.markdown("**Utilizatori configurați**")
-        st.dataframe(pd.DataFrame([{"utilizator": k, "nume": u.get("name", ""),
-                                    "rol": u.get("role", "guest"),
-                                    "expiră": str(u.get("expires", "")),
-                                    "activ": not expired(u)}
-                                   for k, u in load_users().items()]),
-                     use_container_width=True, hide_index=True)
+# sisteme afișate separat, SUB vederea principală (nu intră în total)
+# EXTRA_SITES acceptă: "nume" / ID  sau  {site = "nume sau ID", title = "titlu afișat"}
+extra_keys = (find_secret("EXTRA_SITES") or []) if is_admin else user["extra_sites"]
+n = 0
+for entry in extra_keys:
+    e = dict(entry) if hasattr(entry, "keys") else {"site": entry}
+    for ex in resolve_sites([e.get("site", "")]):
+        if sites == [ex]:
+            continue           # e deja afișat ca vedere principală
+        st.divider()
+        render_section([ex], str(e.get("title") or all_names[ex]),
+                       list(user["hide_base"]), f"x{n}")
+        n += 1
