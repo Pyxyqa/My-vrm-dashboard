@@ -254,10 +254,12 @@ with st.sidebar:
     if is_admin:
         st.caption("ID-uri pentru `sites`: " + ", ".join(f"{n} = {k}" for k, n in names.items()))
     hide = list(user["hide"])
+    total_view = False          # True = vederea „total”, sub care apar sistemele EXTRA
     if user.get("combined") and len(insts) > 1:
         # vedere combinată: suma tuturor sistemelor, fără nume și fără selecție
         sites = [i["idSite"] for i in insts]
         title = "Total sisteme"
+        total_view = True
     else:
         TOTAL = "__total__"
         total_name = str(find_secret("TOTAL_NAME", "Sistem fotovoltaic_Team Montage SRL_PTJ"))
@@ -268,6 +270,7 @@ with st.sidebar:
                            format_func=lambda k: total_name if k == TOTAL else names[k]) \
             if len(options) > 1 else options[0]
         if sel == TOTAL:
+            total_view = True
             # TOTAL_SITES (ID-uri sau nume exacte) e căutat oriunde în Secrets,
             # chiar dacă a ajuns din greșeală sub o secțiune [..]
             raw = find_secret("TOTAL_SITES") or []
@@ -376,15 +379,6 @@ def render_section(sec_sites, sec_title, sec_hide, key, show_diag=False):
         st.error(str(e))
         return
 
-    if is_admin and key == "main":
-        if corr:
-            st.caption("Corecții aplicate: " + "; ".join(
-                f"{c.get('metric')} = 0 între {c.get('from')} și {c.get('to')}"
-                + (f" (sisteme: {', '.join(str(x) for x in c.get('sites', []))})"
-                   if c.get("sites") else "")
-                for c in corr))
-        else:
-            st.caption("Nicio corecție găsită în Secrets.")
 
     daily = V.group_flows(flows, "D")
     if daily.empty:
@@ -478,7 +472,9 @@ render_section(sites, user["title"] or title, hide, "main", show_diag=is_admin)
 
 # sisteme afișate separat, SUB vederea principală (nu intră în total)
 # EXTRA_SITES acceptă: "nume" / ID  sau  {site = "nume sau ID", title = "titlu afișat"}
-extra_keys = (find_secret("EXTRA_SITES") or []) if is_admin else user["extra_sites"]
+# doar sub vederea „total”; la un sistem ales individual nu se afișează nimic în plus
+extra_keys = ((find_secret("EXTRA_SITES") or []) if is_admin else user["extra_sites"]) \
+    if total_view else []
 n = 0
 for entry in extra_keys:
     e = dict(entry) if hasattr(entry, "keys") else {"site": entry}
