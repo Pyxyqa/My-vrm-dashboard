@@ -48,6 +48,13 @@ class VRM:
     def diagnostics(self, site: int) -> list[dict]:
         return self._get(f"/installations/{site}/diagnostics", {"count": 1000})["records"]
 
+    def stats_custom(self, site: int, codes: list, interval: str, start: float, end: float) -> dict:
+        return self._get(
+            f"/installations/{site}/stats",
+            {"type": "custom", "attributeCodes[]": list(codes), "interval": interval,
+             "start": int(start), "end": int(end)},
+        )
+
     def stats(self, site: int, type_: str, interval: str, start: float, end: float) -> dict:
         return self._get(
             f"/installations/{site}/stats",
@@ -117,8 +124,6 @@ def summarize(f: pd.DataFrame) -> pd.DataFrame:
     out["Export rețea"] = f.Pg + f.Bg
     out["Încărcare baterie"] = f.Pb + f.Gb
     out["Descărcare baterie"] = f.Bc + f.Bg + f.Bx
-    out["Autoconsum %"] = ((f.Pc + f.Pb) / prod.where(prod > 0) * 100).fillna(0.0)
-    out["Autonomie %"] = ((f.Pc + f.Bc) / cons.where(cons > 0) * 100).fillna(0.0)
     return out
 
 
@@ -151,6 +156,34 @@ def apply_corrections(flows: pd.DataFrame, corrections, site: int, site_name: st
         f.loc[m, "Bx"] += f.loc[m, "Bg"]
         f.loc[m, "Bg"] = 0.0
     return f
+
+
+SOC_COL = "Procent energie disponibilă în baterii"
+
+
+def soc_end_of_day(payload: dict, tz: str, code: str = "bs") -> pd.Series:
+    """SOC (%) la sfârșitul fiecărei zile, din stats?type=custom&attributeCodes[]=bs&interval=hours.
+
+    Punctele pot fi [ts, valoare] sau [ts, medie, min, max]; se ia ultima valoare din fiecare zi.
+    """
+    recs = payload.get("records") or {}
+    pts = recs.get(code)
+    if not isinstance(pts, list):
+        pts = next((p for p in recs.values() if isinstance(p, list) and p), [])
+    data = {}
+    for p in pts:
+        if isinstance(p, (list, tuple)) and len(p) >= 2 and p[1] is not None:
+            try:
+                data[p[0]] = float(p[1])
+            except (TypeError, ValueError):
+                pass
+    if not data:
+        return pd.Series(dtype="float64")
+    s = pd.Series(data).sort_index()
+    ts = s.index.astype("int64")
+    unit = "ms" if ts.max() > 1e11 else "s"
+    s.index = pd.to_datetime(ts, unit=unit, utc=True).tz_convert(tz).tz_localize(None)
+    return s.groupby(s.index.normalize()).last().clip(0, 100)
 
 
 def with_total(f: pd.DataFrame, labels: list[str]) -> pd.DataFrame:

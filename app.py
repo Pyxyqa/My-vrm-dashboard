@@ -163,6 +163,37 @@ def flows_all(site: int, first_year: int, tz: str) -> pd.DataFrame:
     return df[~df.index.duplicated(keep="last")].sort_index()
 
 
+def _month_bounds(year: int, month: int, tz: str):
+    z = ZoneInfo(tz)
+    start = datetime(year, month, 1, tzinfo=z)
+    nxt = datetime(year + (month == 12), month % 12 + 1, 1, tzinfo=z)
+    return start.timestamp(), min(nxt, datetime.now(z)).timestamp()
+
+
+def _soc_fetch(site, year, month, tz):
+    p = client().stats_custom(site, ["bs"], "hours", *_month_bounds(year, month, tz))
+    return V.soc_end_of_day(p, tz, "bs")
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _soc_current(site: int, year: int, month: int, tz: str) -> pd.Series:
+    return _soc_fetch(site, year, month, tz)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _soc_past(site: int, year: int, month: int, tz: str) -> pd.Series:
+    return _soc_fetch(site, year, month, tz)
+
+
+def soc_month(site: int, year: int, month: int, tz: str) -> pd.Series:
+    now = datetime.now(ZoneInfo(tz))
+    f = _soc_current if (year, month) == (now.year, now.month) else _soc_past
+    try:
+        return f(site, year, month, tz)
+    except V.VRMError:
+        return pd.Series(dtype="float64")
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def diagnostics(site: int) -> list[dict]:
     return client().diagnostics(site)
@@ -213,7 +244,8 @@ def energy_chart(table: pd.DataFrame, title: str, key: str | None = None):
 
 
 def energy_table(table: pd.DataFrame, fname: str, key: str | None = None):
-    cfg = {c: st.column_config.NumberColumn(c, format="%.0f %%") if c.endswith("%")
+    cfg = {c: st.column_config.NumberColumn(c, format="%.0f %%")
+           if c.endswith("%") or c == V.SOC_COL
            else st.column_config.NumberColumn(c + " (kWh)", format="%.2f")
            for c in table.columns}
     st.dataframe(table, column_config=cfg, use_container_width=True)
@@ -316,10 +348,13 @@ def site_tz(sec_sites):
 
 
 @st.fragment(run_every=REFRESH)
-def live_panel(sec_sites, sec_hide, tz, key):
+def live_panel(sec_sites, sec_hide, tz, key, soc_site=None):
     try:
         codes = dict(secret("live_codes", {}) or {})
-        live = V.combine_live([V.live_values(diagnostics(s), codes) for s in sec_sites])
+        lives = {s: V.live_values(diagnostics(s), codes) for s in sec_sites}
+        live = V.combine_live(list(lives.values()))
+        if soc_site in lives:                       # SOC instant doar de la sistemul ales (Ekrano)
+            live["soc"] = lives[soc_site]["soc"]
     except V.VRMError as e:
         st.warning(f"Date live indisponibile: {e}")
         return
@@ -353,7 +388,7 @@ def live_panel(sec_sites, sec_hide, tz, key):
     st.caption(stamp, help=f"Se reîmprospătează automat la {REFRESH} s.")
 
 
-def render_section(sec_sites, sec_title, sec_hide, key, show_diag=False):
+def render_section(sec_sites, sec_title, sec_hide, key, show_diag=False, soc_site=None):
     """Un dashboard complet (flux live + KPI + tabele) pentru unul sau mai multe sisteme."""
     tz = site_tz(sec_sites)
     now = datetime.now(ZoneInfo(tz))
@@ -367,7 +402,7 @@ def render_section(sec_sites, sec_title, sec_hide, key, show_diag=False):
     first_year = max(2010, min(first_year, now.year))
 
     st.title(f"☀️ {sec_title}")
-    live_panel(sec_sites, sec_hide, tz, key)
+    live_panel(sec_sites, sec_hide, tz, key, soc_site)
 
     try:
         with st.spinner("Încarc istoricul de energie din VRM…"):
@@ -415,6 +450,9 @@ def render_section(sec_sites, sec_title, sec_hide, key, show_diag=False):
         m = b.selectbox("Lună", months, format_func=lambda k: LUNI[k - 1], key=f"d_m_{key}")
         sel = daily[(idx.year == y) & (idx.month == m)]
         table = V.with_total(sel, [d.strftime("%d.%m.%Y") for d in sel.index])
+        if soc_site:
+            soc = soc_month(soc_site, y, m, tz)
+            table[V.SOC_COL] = [soc.get(d) for d in sel.index] + [None]   # rândul TOTAL rămâne gol
         energy_chart(table.rename(index=lambda s: s[:5]), f"{LUNI[m - 1]} {y}", key=f"c_d_{key}")
         energy_table(table, f"energie_zilnic{fn}_{y}-{m:02d}.csv", key=f"dl_d_{key}")
 
@@ -468,7 +506,18 @@ def resolve_sites(keys) -> list:
 
 
 # ---------------------------------------------------------------- PAGINA
-render_section(sites, user["title"] or title, hide, "main", show_diag=is_admin)
+# SOC pentru tabelul zilnic: la un singur sistem -> al lui; la total -> SOC_SITE din Secrets
+# (ID sau nume), altfel sistemul din total care are „ekrano” în nume
+if len(sites) == 1:
+    main_soc = sites[0]
+else:
+    cand = resolve_sites([find_secret("SOC_SITE")]) if find_secret("SOC_SITE") else []
+    cand = [c for c in cand if c in sites] or \
+        [s for s in sites if "ekrano" in all_names.get(s, "").lower()]
+    main_soc = cand[0] if cand else None
+    if main_soc and "soc" not in user["hide_base"]:
+        hide = [h for h in hide if h != "soc"]      # la total arătăm SOC-ul Ekrano în cercul bateriei
+render_section(sites, user["title"] or title, hide, "main", show_diag=is_admin, soc_site=main_soc)
 
 # sisteme afișate separat, SUB vederea principală (nu intră în total)
 # EXTRA_SITES acceptă: "nume" / ID  sau  {site = "nume sau ID", title = "titlu afișat"}
@@ -483,5 +532,5 @@ for entry in extra_keys:
             continue           # e deja afișat ca vedere principală
         st.divider()
         render_section([ex], str(e.get("title") or all_names[ex]),
-                       list(user["hide_base"]), f"x{n}")
+                       list(user["hide_base"]), f"x{n}", soc_site=ex)
         n += 1
