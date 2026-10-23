@@ -616,13 +616,13 @@ def vebus_units_raw(portal_id: str, host: str, email: str, wait_s: float = 8.0) 
     return {"values": values, "error": err, "complete": done.is_set() and not state["error"]}
 
 
-_UNIT_BY_LEAF = {"P": "W", "V": "V", "I": "A", "F": "Hz", "S": "VA", "Temperature": "°C", "Soc": "%"}
+PHASE_COLORS = {"L1": "#C8553D", "L2": "#3D405B", "L3": "#5B9279", "—": "#8A8A8A"}
 
 
-def vebus_units_table(values: dict, portal_id: str) -> dict:
-    """{instanța VE.Bus: DataFrame cu un rând pe unitate și o coloană pe mărime}."""
-    pat = re.compile(rf"^N/{re.escape(portal_id)}/vebus/(\d+)/Devices/(\d+)/(.+)$")
-    rows: dict = {}
+def vebus_parse(values: dict, portal_id: str) -> dict:
+    """{instanța VE.Bus: {"units": {n: {cale: valoare}}, "sys": {cale: valoare}}} din topicurile MQTT."""
+    pat = re.compile(rf"^N/{re.escape(portal_id)}/vebus/(\d+)/(.+)$")
+    out: dict = {}
     for topic, payload in values.items():
         m = pat.match(topic)
         if not m:
@@ -630,21 +630,87 @@ def vebus_units_table(values: dict, portal_id: str) -> dict:
         v = payload.get("value") if isinstance(payload, dict) else payload
         if v is None or isinstance(v, (list, dict)):
             continue
-        inst, unit, path = m.groups()
-        leaf = path.rsplit("/", 1)[-1]
-        col = path + (f" [{_UNIT_BY_LEAF[leaf]}]" if leaf in _UNIT_BY_LEAF else "")
-        rows.setdefault(inst, {}).setdefault(int(unit), {})[col] = \
-            round(v, 2) if isinstance(v, float) else v
-    out = {}
-    for inst, units in rows.items():
-        df = pd.DataFrame.from_dict(units, orient="index").sort_index()
-        # mărimile AC întâi (intrare, ieșire), apoi restul alfabetic
-        cols = sorted(df.columns, key=lambda c: (not c.startswith("Ac/"), c))
-        df = df[cols]
-        df.index = [f"Unitatea {i + 1}" for i in df.index]
-        df.index.name = "Quattro"
-        out[inst] = df
-    return out
+        inst, path = m.groups()
+        d = out.setdefault(inst, {"units": {}, "sys": {}})
+        u = re.match(r"^Devices/(\d+)/(.+)$", path)
+        if u:
+            d["units"].setdefault(int(u.group(1)), {})[u.group(2)] = v
+        else:
+            d["sys"][path] = v
+    return {k: v for k, v in out.items() if v["units"]}
+
+
+def _f(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def unit_phases(n_units: int, sys: dict) -> list[str]:
+    """Faza fiecărei unități, după ordinea în care le numerotează GX-ul: L1, L2, L3, L1, L2, L3…"""
+    phases = int(_f(sys.get("Ac/NumberOfPhases")) or 0) or \
+        len([p for p in ("L1", "L2", "L3") if f"Ac/Out/{p}/P" in sys]) or 1
+    if phases == 1:
+        return ["L1"] * n_units
+    if n_units % phases:
+        return ["—"] * n_units
+    return [f"L{i % phases + 1}" for i in range(n_units)]
+
+
+def units_frame(d: dict) -> pd.DataFrame:
+    """Un rând pe Quattro, ordonat pe faze, cu mărimile utile."""
+    idx = sorted(d["units"])
+    phases = unit_phases(len(idx), d["sys"])
+    nph = max(1, len(set(phases) - {"—"}))
+    rows = []
+    for k, (n, ph) in enumerate(zip(idx, phases)):
+        u = d["units"][n]
+        p_in, p_out, p_bat = _f(u.get("Ac/In/P")), _f(u.get("Ac/Out/P")), _f(u.get("Ac/Inverter/P"))
+        ubat = _f(u.get("Diagnostics/UBatTerminal"))
+        rows.append({
+            "Quattro": f"{ph} / {k // nph + 1}" if ph != "—" else f"Unitatea {k + 1}",
+            "Fază": ph,
+            "Serie": str(u.get("SerialNumber") or ""),
+            "Intrare AC (W)": p_in,
+            "Ieșire AC (W)": p_out,
+            "Spre baterie (W)": p_bat,
+            "Tensiune baterie (V)": ubat,
+            # curent DC estimat din puterea spre baterie (fără pierderile de conversie)
+            "Curent baterie ≈ (A)": round(p_bat / ubat, 1) if p_bat is not None and ubat else None,
+        })
+    df = pd.DataFrame(rows)
+    # abaterea ieșirii față de media unităților de pe aceeași fază
+    mean = df.groupby("Fază")["Ieșire AC (W)"].transform("mean")
+    df["Abatere de la media fazei (%)"] = ((df["Ieșire AC (W)"] - mean) / mean.where(mean.abs() > 50) * 100).round(0) + 0.0
+    order = {"L1": 0, "L2": 1, "L3": 2}
+    df["_o"] = df["Fază"].map(order).fillna(9)
+    return df.sort_values(["_o"], kind="stable").drop(columns="_o").reset_index(drop=True)
+
+
+def phase_frame(sys: dict) -> pd.DataFrame:
+    """Valorile sistemului pe fiecare fază (intrare activă și ieșire)."""
+    rows = []
+    for p in ("L1", "L2", "L3"):
+        r = {"Fază": p}
+        for side, base in (("Intrare", "Ac/ActiveIn"), ("Ieșire", "Ac/Out")):
+            for leaf, label in (("V", "V"), ("I", "A"), ("P", "W"), ("F", "Hz")):
+                r[f"{side} ({label})"] = _f(sys.get(f"{base}/{p}/{leaf}"))
+        if any(v is not None for k, v in r.items() if k != "Fază"):
+            rows.append(r)
+    df = pd.DataFrame(rows)
+    return df.dropna(axis=1, how="all") if not df.empty else df
+
+
+def check_phases(df: pd.DataFrame, sys: dict) -> list[str]:
+    """Verifică ordinea L1/L2/L3: suma unităților pe fază ≈ puterea fazei raportată de sistem."""
+    bad = []
+    for p, g in df.groupby("Fază"):
+        ref = _f(sys.get(f"Ac/Out/{p}/P"))
+        s = g["Ieșire AC (W)"].sum(min_count=1)
+        if ref is not None and pd.notna(s) and abs(s - ref) > max(300, 0.15 * abs(ref)):
+            bad.append(f"{p}: unitățile însumează {s:.0f} W, faza raportează {ref:.0f} W")
+    return bad
 
 
 def vebus_units_section(site: int):
@@ -664,30 +730,87 @@ def vebus_units_section(site: int):
     except ModuleNotFoundError:
         st.error("Lipsește biblioteca paho-mqtt: adaug-o în requirements.txt.")
         return
-    tables = vebus_units_table(res["values"], pid)
-    if res["error"] and not tables:
+    systems = vebus_parse(res["values"], pid)
+    if res["error"] and not systems:
         st.warning(f"MQTT VRM: {res['error']}. Verifică VRM_EMAIL (același cont ca token-ul) și, pe GX, "
                    "Setări → Servicii → MQTT pornit.")
         return
-    if not tables:
+    if not systems:
         st.info("GX-ul nu a publicat date pe unități (Devices/…) pentru VE.Bus. Verifică pe GX: "
                 "Setări → Servicii → MQTT pornit.")
         return
-    for vb, df in tables.items():
-        if len(tables) > 1:
+
+    for vb, d in systems.items():
+        if len(systems) > 1:
             st.caption(f"Sistem VE.Bus, instanța {vb}")
-        st.dataframe(df, use_container_width=True)
-        pcol = next((c for c in df.columns if re.fullmatch(r"Ac/Out/P \[W\]", c)), None) or \
-            next((c for c in df.columns if re.fullmatch(r"Ac/Out/L\d/P \[W\]", c)), None)
-        num = pd.to_numeric(df[pcol], errors="coerce") if pcol else None
-        if num is not None and num.notna().any():
-            fig = go.Figure(go.Bar(x=df.index, y=num, marker_color="#3B7DD8",
-                                   hovertemplate="%{y:.0f} W"))
-            fig.update_layout(title="Putere ieșire AC pe fiecare Quattro", height=300, yaxis_title="W",
-                              margin=dict(l=10, r=10, t=40, b=10))
+        sys = d["sys"]
+        df = units_frame(d)
+
+        # bateria, așa cum o vede sistemul VE.Bus
+        bat = [("SOC baterie", sys.get("Soc"), "%", 0), ("Tensiune baterie", sys.get("Dc/0/Voltage"), "V", 2),
+               ("Curent baterie", sys.get("Dc/0/Current"), "A", 1), ("Putere baterie", sys.get("Dc/0/Power"), "W", 0)]
+        bat = [(lbl, _f(v), u, dec) for lbl, v, u, dec in bat if _f(v) is not None]
+        if bat:
+            for col, (lbl, v, u, dec) in zip(st.columns(len(bat)), bat):
+                col.metric(lbl, f"{v:.{dec}f} {u}")
+
+        ph = phase_frame(sys)
+        if not ph.empty:
+            st.markdown("**Pe faze**")
+            st.dataframe(ph, hide_index=True, use_container_width=True,
+                         column_config={c: st.column_config.NumberColumn(
+                             c, format="%.0f" if c.endswith("(W)") else "%.1f" if "(A)" in c
+                             else "%.2f" if "(Hz)" in c else "%.1f") for c in ph.columns if c != "Fază"})
+
+        st.markdown("**Pe fiecare Quattro**")
+        pmax = max(100.0, float(df["Ieșire AC (W)"].abs().max() or 0))
+        tot = {"Quattro": "TOTAL", "Fază": "", "Serie": "",
+               "Intrare AC (W)": df["Intrare AC (W)"].sum(min_count=1),
+               "Ieșire AC (W)": df["Ieșire AC (W)"].sum(min_count=1),
+               "Spre baterie (W)": df["Spre baterie (W)"].sum(min_count=1),
+               "Tensiune baterie (V)": None,
+               "Curent baterie ≈ (A)": df["Curent baterie ≈ (A)"].sum(min_count=1),
+               "Abatere de la media fazei (%)": None}
+        shown = df.drop(columns=["Serie"] if not df["Serie"].str.len().any() else [])
+        st.dataframe(
+            shown, hide_index=True, use_container_width=True,
+            column_config={
+                "Ieșire AC (W)": st.column_config.ProgressColumn(
+                    "Ieșire AC (W)", format="%.0f W", min_value=0, max_value=pmax),
+                "Intrare AC (W)": st.column_config.NumberColumn(format="%.0f"),
+                "Spre baterie (W)": st.column_config.NumberColumn(
+                    format="%.0f", help="Intrare − ieșire: + se încarcă bateria, − se descarcă"),
+                "Tensiune baterie (V)": st.column_config.NumberColumn(format="%.2f",
+                                                                      help="La bornele unității"),
+                "Curent baterie ≈ (A)": st.column_config.NumberColumn(
+                    format="%.1f", help="Estimat: putere spre baterie ÷ tensiune (fără pierderi)"),
+                "Abatere de la media fazei (%)": st.column_config.NumberColumn(format="%+.0f %%"),
+            })
+        t = pd.DataFrame([tot])[[c for c in shown.columns]]
+        st.dataframe(t, hide_index=True, use_container_width=True,
+                     column_config={c: st.column_config.NumberColumn(format="%.0f")
+                                    for c in ("Intrare AC (W)", "Ieșire AC (W)", "Spre baterie (W)")} |
+                     {"Curent baterie ≈ (A)": st.column_config.NumberColumn(format="%.1f")})
+
+        num = pd.to_numeric(df["Ieșire AC (W)"], errors="coerce")
+        if num.notna().any():
+            fig = go.Figure()
+            for p in df["Fază"].unique():
+                g = df[df["Fază"] == p]
+                fig.add_bar(name=p, x=g["Quattro"], y=g["Ieșire AC (W)"],
+                            marker_color=PHASE_COLORS.get(p, "#8A8A8A"), hovertemplate="%{y:.0f} W")
+            fig.update_layout(title="Putere ieșire AC pe fiecare Quattro", height=320, yaxis_title="W",
+                              legend=dict(orientation="h", y=-0.2), margin=dict(l=10, r=10, t=40, b=10))
             st.plotly_chart(fig, use_container_width=True, key=f"vbu_{site}_{vb}")
+
+        for msg in check_phases(df, sys):
+            st.warning("Ordinea L1/L2/L3 pare să nu se potrivească – " + msg)
+        if "—" in set(df["Fază"]):
+            st.caption("Faza unităților nu a putut fi dedusă (număr de unități nedivizibil cu numărul de faze).")
+
     st.caption("Sursa: MQTT VRM (" + ("toate topicurile primite" if res["complete"] else
-               "răspuns parțial, reîncearcă la următoarea reîmprospătare") + ").")
+               "răspuns parțial, se completează la următoarea reîmprospătare") + "). Faza unităților e dedusă "
+               "din ordinea GX: L1, L2, L3, L1, L2, L3…")
 
 
 def _device_card(d: dict, recs: list[dict], now: float, tz: str, expand: bool):
