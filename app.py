@@ -521,6 +521,171 @@ def _matches(d: dict, q: str) -> list[dict]:
             if any(q in str(r.get(k) or "").lower() for k in ("description", "dbusPath", "code"))]
 
 
+# ---------------------------------------------------------------- fiecare Quattro (MQTT VRM)
+# Diagnosticul VRM are un singur „VE.Bus System”; datele pe fiecare unitate din sistemul paralel/trifazat
+# le publică GX-ul doar pe MQTT (N/<portal>/vebus/<inst>/Devices/<n>/...). Le citim din brokerul MQTT
+# al VRM, cu emailul contului (VRM_EMAIL) și același token. Pe GX: Setări → Servicii → MQTT pornit.
+# Documentație: github.com/victronenergy/dbus-flashmq (secțiunea „Connecting to the VRM MQTT servers”).
+VENUS_CA = """-----BEGIN CERTIFICATE-----
+MIIECTCCAvGgAwIBAgIJAM+t3iC8ybEHMA0GCSqGSIb3DQEBCwUAMIGZMQswCQYD
+VQQGEwJOTDESMBAGA1UECAwJR3JvbmluZ2VuMRIwEAYDVQQHDAlHcm9uaW5nZW4x
+HDAaBgNVBAoME1ZpY3Ryb24gRW5lcmd5IEIuVi4xIzAhBgNVBAsMGkNDR1ggQ2Vy
+dGlmaWNhdGUgQXV0aG9yaXR5MR8wHQYJKoZIhvcNAQkBFhBzeXNhZG1pbkB5dGVj
+Lm5sMCAXDTE0MDkxNzExNTQxOVoYDzIxMTQwODI0MTE1NDE5WjCBmTELMAkGA1UE
+BhMCTkwxEjAQBgNVBAgMCUdyb25pbmdlbjESMBAGA1UEBwwJR3JvbmluZ2VuMRww
+GgYDVQQKDBNWaWN0cm9uIEVuZXJneSBCLlYuMSMwIQYDVQQLDBpDQ0dYIENlcnRp
+ZmljYXRlIEF1dGhvcml0eTEfMB0GCSqGSIb3DQEJARYQc3lzYWRtaW5AeXRlYy5u
+bDCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAKVdbAUAElbX+Sh0FATX
+yhlJ6zqYMHbqCXawgsOe09zHynDCT4GTXuSuoH2kR/1jE8zvWNLHORXa/eahzWJP
+V4WpXuYsFEyU3r8hxA6y+SR06IT7WHdfN6LXN+qt5KLQbmQLxeb1zElMKW4io/WE
+N+SWpo5dklXAS6vnq+VRTNwRYnPOUIXKduhvTQp6hEHnLBjYC/Ot8SkC8KtL88cW
+pH6d7UmeW3333/vNMEMOTLWlOWrR30P6R+gTjbvzasaB6tlcYqW+jO1YDlBwhSEV
+4As4ziQysuy4qvm41KY/o4Q6P6npsh8MaZuRmi/UTxU2DHAbs/on7qaRi6IkVgvg
+o6kCAwEAAaNQME4wHQYDVR0OBBYEFPjmM5NYXMw7Wc/TgbLtwPnMAfewMB8GA1Ud
+IwQYMBaAFPjmM5NYXMw7Wc/TgbLtwPnMAfewMAwGA1UdEwQFMAMBAf8wDQYJKoZI
+hvcNAQELBQADggEBAEFTeGcmxzzXJIfgUrfKLki+hi2mR9g7qomvw6IB1JQHefIw
+iKXe14gdp0ytjYL6QoTeEbS2A8VI2FvSbusAzn0JqXdZI+Gwt/CuH0XH40QHpaQ5
+UAB5d7EGvbB2op7AA/IyR5TwF/cDb1fRbTaTmwDOIo3kuFGEyNCc+PFrN2MvtPHn
+hHH7fo7joY7mUKdP573bJXFsLwZxlqiycJreroLPFqYwgChaMTStQ71rP5i1eGtg
+ealQ7kPVtlHmX89tCkfkK77ojm48qgl4gwsI01SikstaPP9fr4ck+U/qIKhSg+Bg
+nc9OImY9ubQxe+/GQP4KFme2PPqthEWys7ut2HM=
+-----END CERTIFICATE-----
+"""
+
+
+def mqtt_host(inst: dict) -> str:
+    """Brokerul VRM al instalației: mqtt<suma ord(caractere ID portal) % 128>.victronenergy.com."""
+    if inst.get("mqtt_host"):
+        return str(inst["mqtt_host"])
+    pid = str(inst.get("identifier", "")).lower().strip()
+    return f"mqtt{sum(ord(c) for c in pid) % 128}.victronenergy.com"
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def vebus_units_raw(portal_id: str, host: str, email: str, wait_s: float = 8.0) -> dict:
+    """Citește o dată toate topicurile N/<portal>/vebus/# (keep-alive -> GX-ul republică tot)."""
+    import json
+    import ssl
+    import threading
+    import uuid
+
+    import paho.mqtt.client as mqtt
+
+    values: dict = {}
+    state = {"error": None}
+    done = threading.Event()
+    connected = threading.Event()
+
+    def on_connect(c, userdata, flags, rc, properties=None):
+        if rc.is_failure:
+            state["error"] = f"conectare refuzată de broker: {rc}"
+            done.set()
+            return
+        connected.set()
+        c.subscribe([(f"N/{portal_id}/vebus/#", 0), (f"N/{portal_id}/full_publish_completed", 0)])
+        c.publish(f"R/{portal_id}/keepalive", "")
+
+    def on_message(c, userdata, msg):
+        if msg.topic.endswith("/full_publish_completed"):
+            done.set()
+            return
+        try:
+            values[msg.topic] = json.loads(msg.payload or b"null")
+        except ValueError:
+            values[msg.topic] = {"value": msg.payload.decode(errors="replace")}
+
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"vrmdash_{uuid.uuid4().hex[:12]}")
+    client.username_pw_set(email, f"Token {st.secrets['VRM_TOKEN']}")
+    client.tls_set_context(ssl.create_default_context(cadata=VENUS_CA))
+    client.on_connect, client.on_message = on_connect, on_message
+    try:
+        client.connect(host, 8883, keepalive=30)
+    except Exception as e:                       # DNS, rețea, TLS
+        return {"values": {}, "error": f"nu pot contacta {host}: {e}", "complete": False}
+    client.loop_start()
+    try:
+        done.wait(wait_s)
+    finally:
+        client.loop_stop()
+        client.disconnect()
+    err = state["error"] or (None if connected.is_set() else f"fără răspuns de la {host}")
+    return {"values": values, "error": err, "complete": done.is_set() and not state["error"]}
+
+
+_UNIT_BY_LEAF = {"P": "W", "V": "V", "I": "A", "F": "Hz", "S": "VA", "Temperature": "°C", "Soc": "%"}
+
+
+def vebus_units_table(values: dict, portal_id: str) -> dict:
+    """{instanța VE.Bus: DataFrame cu un rând pe unitate și o coloană pe mărime}."""
+    pat = re.compile(rf"^N/{re.escape(portal_id)}/vebus/(\d+)/Devices/(\d+)/(.+)$")
+    rows: dict = {}
+    for topic, payload in values.items():
+        m = pat.match(topic)
+        if not m:
+            continue
+        v = payload.get("value") if isinstance(payload, dict) else payload
+        if v is None or isinstance(v, (list, dict)):
+            continue
+        inst, unit, path = m.groups()
+        leaf = path.rsplit("/", 1)[-1]
+        col = path + (f" [{_UNIT_BY_LEAF[leaf]}]" if leaf in _UNIT_BY_LEAF else "")
+        rows.setdefault(inst, {}).setdefault(int(unit), {})[col] = \
+            round(v, 2) if isinstance(v, float) else v
+    out = {}
+    for inst, units in rows.items():
+        df = pd.DataFrame.from_dict(units, orient="index").sort_index()
+        # mărimile AC întâi (intrare, ieșire), apoi restul alfabetic
+        cols = sorted(df.columns, key=lambda c: (not c.startswith("Ac/"), c))
+        df = df[cols]
+        df.index = [f"Unitatea {i + 1}" for i in df.index]
+        df.index.name = "Quattro"
+        out[inst] = df
+    return out
+
+
+def vebus_units_section(site: int):
+    st.markdown("#### Fiecare Quattro")
+    inst = next((i for i in installations() if i["idSite"] == site), {})
+    email = find_secret("VRM_EMAIL")
+    if not email:
+        st.info("Pentru datele pe fiecare Quattro, adaugă în Secrets linia "
+                "`VRM_EMAIL = \"emailul contului VRM\"` (deasupra primei linii care începe cu `[`).")
+        return
+    pid = str(inst.get("identifier", "")).strip()
+    if not pid:
+        st.warning("VRM nu a întors ID-ul de portal al acestui sistem.")
+        return
+    try:
+        res = vebus_units_raw(pid, mqtt_host(inst), str(email))
+    except ModuleNotFoundError:
+        st.error("Lipsește biblioteca paho-mqtt: adaug-o în requirements.txt.")
+        return
+    tables = vebus_units_table(res["values"], pid)
+    if res["error"] and not tables:
+        st.warning(f"MQTT VRM: {res['error']}. Verifică VRM_EMAIL (același cont ca token-ul) și, pe GX, "
+                   "Setări → Servicii → MQTT pornit.")
+        return
+    if not tables:
+        st.info("GX-ul nu a publicat date pe unități (Devices/…) pentru VE.Bus. Verifică pe GX: "
+                "Setări → Servicii → MQTT pornit.")
+        return
+    for vb, df in tables.items():
+        if len(tables) > 1:
+            st.caption(f"Sistem VE.Bus, instanța {vb}")
+        st.dataframe(df, use_container_width=True)
+        pcol = next((c for c in df.columns if re.fullmatch(r"Ac/Out/P \[W\]", c)), None) or \
+            next((c for c in df.columns if re.fullmatch(r"Ac/Out/L\d/P \[W\]", c)), None)
+        num = pd.to_numeric(df[pcol], errors="coerce") if pcol else None
+        if num is not None and num.notna().any():
+            fig = go.Figure(go.Bar(x=df.index, y=num, marker_color="#3B7DD8",
+                                   hovertemplate="%{y:.0f} W"))
+            fig.update_layout(title="Putere ieșire AC pe fiecare Quattro", height=300, yaxis_title="W",
+                              margin=dict(l=10, r=10, t=40, b=10))
+            st.plotly_chart(fig, use_container_width=True, key=f"vbu_{site}_{vb}")
+    st.caption("Sursa: MQTT VRM (" + ("toate topicurile primite" if res["complete"] else
+               "răspuns parțial, reîncearcă la următoarea reîmprospătare") + ").")
+
+
 def _device_card(d: dict, recs: list[dict], now: float, tz: str, expand: bool):
     with st.container(border=True):
         badge = " · ⚠️ date vechi" if d["stale"] else ""
@@ -604,6 +769,8 @@ def _site_body(site: int, name: str, tz: str, get_diag, get_overview, query: str
         st.dataframe(_summary([d for d, _ in shown], now), use_container_width=True, hide_index=True)
     for d, recs in shown:
         _device_card(d, recs, now, tz, expand=bool(query))
+    if cat == "inverter" and not query:
+        vebus_units_section(site)
 
     csv = pd.concat([device_table(d["records"], now).assign(Dispozitiv=d["name"],
                                                                Instanța=d["instance"])
