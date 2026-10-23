@@ -596,7 +596,11 @@ def vebus_units_raw(portal_id: str, host: str, email: str, wait_s: float = 8.0) 
 
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"vrmdash_{uuid.uuid4().hex[:12]}")
     client.username_pw_set(email, f"Token {st.secrets['VRM_TOKEN']}")
-    client.tls_set_context(ssl.create_default_context(cadata=VENUS_CA))
+    ctx = ssl.create_default_context(cadata=VENUS_CA)
+    # Python 3.13+ respinge implicit CA-ul Victron (Basic Constraints nemarcat „critical”);
+    # oprim doar regula strictă, certificatul și numele serverului rămân verificate
+    ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+    client.tls_set_context(ctx)
     client.on_connect, client.on_message = on_connect, on_message
     try:
         client.connect(host, 8883, keepalive=30)
