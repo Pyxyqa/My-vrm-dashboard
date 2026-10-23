@@ -680,12 +680,14 @@ def units_frame(d: dict) -> pd.DataFrame:
             "Curent baterie ≈ (A)": round(p_bat / ubat, 1) if p_bat is not None and ubat else None,
         })
     df = pd.DataFrame(rows)
-    # abaterea ieșirii față de media unităților de pe aceeași fază
-    mean = df.groupby("Fază")["Ieșire AC (W)"].transform("mean")
-    df["Abatere de la media fazei (%)"] = ((df["Ieșire AC (W)"] - mean) / mean.where(mean.abs() > 50) * 100).round(0) + 0.0
     order = {"L1": 0, "L2": 1, "L3": 2}
     df["_o"] = df["Fază"].map(order).fillna(9)
     return df.sort_values(["_o"], kind="stable").drop(columns="_o").reset_index(drop=True)
+
+
+def _full_height(rows: int) -> int:
+    """Înălțimea unui st.dataframe care arată toate rândurile, fără derulare internă."""
+    return 38 + 35 * rows
 
 
 def phase_frame(sys: dict) -> pd.DataFrame:
@@ -757,26 +759,31 @@ def vebus_units_section(site: int):
         ph = phase_frame(sys)
         if not ph.empty:
             st.markdown("**Pe faze**")
-            st.dataframe(ph, hide_index=True, use_container_width=True,
+            st.dataframe(ph, hide_index=True, use_container_width=True, height=_full_height(len(ph)),
                          column_config={c: st.column_config.NumberColumn(
                              c, format="%.0f" if c.endswith("(W)") else "%.1f" if "(A)" in c
                              else "%.2f" if "(Hz)" in c else "%.1f") for c in ph.columns if c != "Fază"})
 
         st.markdown("**Pe fiecare Quattro**")
-        pmax = max(100.0, float(df["Ieșire AC (W)"].abs().max() or 0))
+        # scală fixă: cât de încărcat e fiecare aparat față de puterea nominală (QUATTRO_MAX_W, implicit 15 000 W)
+        pmax = float(find_secret("QUATTRO_MAX_W", 15000) or 15000)
+        bar_kw = dict(format="%.0f W", min_value=0, max_value=pmax,
+                      help=f"Bara: încărcarea față de {pmax:.0f} W pe aparat")
+        try:
+            bar = st.column_config.ProgressColumn("Ieșire AC (W)", color="#3B7DD8", **bar_kw)
+        except TypeError:                     # Streamlit mai vechi, fără parametrul color
+            bar = st.column_config.ProgressColumn("Ieșire AC (W)", **bar_kw)
         tot = {"Quattro": "TOTAL", "Fază": "", "Serie": "",
                "Intrare AC (W)": df["Intrare AC (W)"].sum(min_count=1),
                "Ieșire AC (W)": df["Ieșire AC (W)"].sum(min_count=1),
                "Spre baterie (W)": df["Spre baterie (W)"].sum(min_count=1),
                "Tensiune baterie (V)": None,
-               "Curent baterie ≈ (A)": df["Curent baterie ≈ (A)"].sum(min_count=1),
-               "Abatere de la media fazei (%)": None}
+               "Curent baterie ≈ (A)": df["Curent baterie ≈ (A)"].sum(min_count=1)}
         shown = df.drop(columns=["Serie"] if not df["Serie"].str.len().any() else [])
         st.dataframe(
-            shown, hide_index=True, use_container_width=True,
+            shown, hide_index=True, use_container_width=True, height=_full_height(len(shown)),
             column_config={
-                "Ieșire AC (W)": st.column_config.ProgressColumn(
-                    "Ieșire AC (W)", format="%.0f W", min_value=0, max_value=pmax),
+                "Ieșire AC (W)": bar,
                 "Intrare AC (W)": st.column_config.NumberColumn(format="%.0f"),
                 "Spre baterie (W)": st.column_config.NumberColumn(
                     format="%.0f", help="Intrare − ieșire: + se încarcă bateria, − se descarcă"),
@@ -784,7 +791,6 @@ def vebus_units_section(site: int):
                                                                       help="La bornele unității"),
                 "Curent baterie ≈ (A)": st.column_config.NumberColumn(
                     format="%.1f", help="Estimat: putere spre baterie ÷ tensiune (fără pierderi)"),
-                "Abatere de la media fazei (%)": st.column_config.NumberColumn(format="%+.0f %%"),
             })
         t = pd.DataFrame([tot])[[c for c in shown.columns]]
         st.dataframe(t, hide_index=True, use_container_width=True,
