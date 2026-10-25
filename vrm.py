@@ -159,7 +159,7 @@ def apply_corrections(flows: pd.DataFrame, corrections, site: int, site_name: st
 
 
 SOC_COL = "Procent energie disponibilă în baterii"
-ENERGY_COL = "Energie disponibilă în baterii la sfarsitul zilei"   # afișat cu (kWh)
+ENERGY_COL = "En.în baterii la sf. zilei"   # afișat cu (kWh)
 
 
 def soc_end_of_day(payload: dict, tz: str, code: str = "bs") -> pd.Series:
