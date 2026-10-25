@@ -1,7 +1,6 @@
 """Dashboard fotovoltaic Victron VRM – Streamlit, cu login admin/oaspeți."""
 from __future__ import annotations
 
-import re
 import time
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
@@ -127,8 +126,13 @@ def login_gate() -> dict:
 
 # ================================================================ DATE VRM
 @st.cache_resource
+def _client_for(token: str) -> V.VRM:
+    return V.VRM(token)
+
+
 def client() -> V.VRM:
-    return V.VRM(st.secrets["VRM_TOKEN"])
+    # legat de valoarea token-ului: dacă schimbi VRM_TOKEN în Secrets, se folosește imediat cel nou
+    return _client_for(str(st.secrets["VRM_TOKEN"]).strip())
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -254,694 +258,6 @@ def energy_table(table: pd.DataFrame, fname: str, key: str | None = None):
                        file_name=fname, mime="text/csv", key=key)
 
 
-# ================================================================ DISPOZITIVE (doar admin)
-# Al doilea dashboard: fiecare invertor, MPPT și baterie, cu valorile instantanee din
-# /installations/{id}/diagnostics. Se deschide cu butonul din bara laterală sau cu ?pagina=dispozitive.
-@st.cache_data(ttl=3600, show_spinner=False)
-def system_overview(site: int) -> list[dict]:
-    """Nume personalizate, model, firmware – doar pentru etichete; pagina merge și fără."""
-    recs = client()._get(f"/installations/{site}/system-overview").get("records") or {}
-    devs = recs.get("devices") if isinstance(recs, dict) else recs
-    return [d for d in (devs or []) if isinstance(d, dict)]
-
-
-# Grupează înregistrările din /diagnostics pe dispozitiv (Device + instance) și extrage
-# mărimile principale pentru fiecare invertor, MPPT și baterie.
-CATEGORY_ORDER = ["inverter", "mppt", "battery", "other"]
-
-# (eticheta afișată, căi D-Bus, descrieri VRM în engleză ca rezervă, mod: first | sum | join)
-HEADLINES = {
-    "inverter": [
-        ("Stare", [r"/State$", r"/StatusCode$"], [r"^(ve\.bus )?state$", r"^status$"], "first"),
-        ("Putere ieșire AC", [r"/Ac/Out/L\d/P$", r"^/Ac/Power$"],
-         [r"^output power( l?\d)?$"], "sum"),
-        ("Putere intrare AC", [r"/Ac/ActiveIn/L\d/P$"], [r"^input power( l?\d)?$"], "sum"),
-        ("Putere PV", [r"/Yield/Power$"], [r"^pv power$"], "first"),
-        ("Tensiune ieșire", [r"/Ac/Out/L1/V$", r"/Ac/L1/Voltage$"],
-         [r"^output voltage( phase)? ?(l)?1$"], "first"),
-        ("Curent ieșire", [r"/Ac/Out/L1/I$", r"/Ac/L1/Current$"],
-         [r"^output current( phase)? ?(l)?1$"], "first"),
-        ("Tensiune intrare", [r"/Ac/ActiveIn/L1/V$"], [r"^input voltage( phase)? ?(l)?1$"], "first"),
-        ("Frecvență ieșire", [r"/Ac/Out/L1/F$"], [r"^output frequency"], "first"),
-        ("Tensiune DC", [r"/Dc/0/Voltage$"], [r"^(battery|dc) voltage$"], "first"),
-        ("Curent DC", [r"/Dc/0/Current$"], [r"^(battery|dc) current$"], "first"),
-        ("SOC", [r"/Soc$"], [r"^(state of charge|soc)$"], "first"),
-        ("Temperatură", [r"/Dc/0/Temperature$"], [r"temperature$"], "first"),
-        ("Producție totală", [r"/Ac/Energy/Forward$"], [r"^energy"], "first"),
-    ],
-    "mppt": [
-        ("Stare", [r"/State$"], [r"^(charge )?state$"], "first"),
-        ("Putere PV", [r"/Yield/Power$", r"/Pv/\d+/P$"], [r"^pv power$"], "first"),
-        ("Tensiune PV", [r"/Pv/V$", r"/Pv/\d+/V$"], [r"^pv voltage"], "join"),
-        ("Curent PV", [r"/Pv/I$", r"/Pv/\d+/I$"], [r"^pv current"], "join"),
-        ("Tensiune baterie", [r"/Dc/0/Voltage$"], [r"^(battery|charger) voltage$"], "first"),
-        ("Curent încărcare", [r"/Dc/0/Current$"], [r"^(battery|charge) current$"], "first"),
-        ("Producție azi", [r"/History/Daily/0/Yield$"], [r"^yield today$"], "first"),
-        ("Putere max. azi", [r"/History/Daily/0/MaxPower$"], [r"^maximum charge power today$"], "first"),
-        ("Mod MPP", [r"/MppOperationMode$"], [r"tracker operation mode|mpp"], "first"),
-        ("Temperatură", [r"/Dc/0/Temperature$"], [r"temperature$"], "first"),
-        ("Eroare", [r"/ErrorCode$"], [r"^error( code)?$"], "first"),
-    ],
-    "battery": [
-        ("SOC", [r"/Soc$"], [r"^(state of charge|soc)$"], "first"),
-        ("Tensiune", [r"/Dc/0/Voltage$"], [r"^(battery )?voltage$"], "first"),
-        ("Curent", [r"/Dc/0/Current$"], [r"^(battery )?current$"], "first"),
-        ("Putere", [r"/Dc/0/Power$"], [r"^(battery )?power$"], "first"),
-        ("Temperatură", [r"/Dc/0/Temperature$"], [r"^(battery )?temperature$"], "first"),
-        ("SOH", [r"/Soh$"], [r"^(state of health|soh)$"], "first"),
-        ("Stare", [r"/State$", r"/Info/ChargeRequest$"], [r"^state$"], "first"),
-        ("Celulă min.", [r"/System/MinCellVoltage$"], [r"^min(imum)? cell voltage$"], "first"),
-        ("Celulă max.", [r"/System/MaxCellVoltage$"], [r"^max(imum)? cell voltage$"], "first"),
-        ("Temp. celule min.", [r"/System/MinCellTemperature$"], [r"^min(imum)? cell temp"], "first"),
-        ("Temp. celule max.", [r"/System/MaxCellTemperature$"], [r"^max(imum)? cell temp"], "first"),
-        ("Curent max. încărcare", [r"/Info/MaxChargeCurrent$"], [r"^max(imum)? charge current"], "first"),
-        ("Curent max. descărcare", [r"/Info/MaxDischargeCurrent$"],
-         [r"^max(imum)? discharge current"], "first"),
-        ("Tensiune max. încărcare", [r"/Info/MaxChargeVoltage$"], [r"^max(imum)? charge voltage"], "first"),
-        ("Timp rămas", [r"/TimeToGo$"], [r"^time to go$"], "first"),
-        ("Module online", [r"/System/NrOfModulesOnline$"], [r"modules online"], "first"),
-    ],
-    "other": [
-        ("Stare", [r"^/?State$"], [r"^state$"], "first"),
-        ("Putere", [r"/Ac/Power$", r"/Dc/0/Power$"], [r"^power$"], "first"),
-        ("Tensiune", [r"/Dc/0/Voltage$", r"/Ac/L1/Voltage$"], [r"^voltage$"], "first"),
-        ("Curent", [r"/Dc/0/Current$", r"/Ac/L1/Current$"], [r"^current$"], "first"),
-        ("Temperatură", [r"/Temperature$"], [r"^temperature$"], "first"),
-    ],
-}
-
-# tipul mărimii, după unitatea din formattedValue / formatWithUnit (Wh înaintea lui W, VA înaintea lui V)
-_UNIT_KIND = [
-    (r"\b(k?Wh|Ah)$", "Energie"),
-    (r"\b(k?W|k?VA)$", "Putere"),
-    (r"\bV$", "Tensiune"),
-    (r"\bA$", "Curent"),
-    (r"(°\s?[CF]|\bK)$", "Temperatură"),
-    (r"%$", "Procent / SOC"),
-    (r"\bHz$", "Frecvență"),
-]
-_STATE_DESC = r"state|status|mode|error|alarm|warning|relay|connected|allowed|request|active"
-KIND_ORDER = ["Stare", "Putere", "Tensiune", "Curent", "Procent / SOC", "Temperatură",
-              "Frecvență", "Energie", "Altele"]
-
-
-def _txt(v) -> str:
-    return "" if v is None else str(v).strip()
-
-
-def device_category(service: str, device: str) -> str:
-    s, d = service.lower(), device.lower()
-    if s == "pvinverter" or "pv inverter" in d:
-        return "inverter"
-    if s == "solarcharger" or "solar charger" in d or "mppt" in d:
-        return "mppt"
-    if s in ("vebus", "inverter", "multi", "acsystem") or \
-            any(w in d for w in ("ve.bus", "inverter", "multi", "quattro")):
-        return "inverter"
-    if s == "battery" or any(w in d for w in ("battery", "bms", "shunt", "lynx")):
-        return "battery"
-    return "other"
-
-
-def value_kind(r: dict) -> str:
-    for src in (_txt(r.get("formattedValue")), _txt(r.get("formatWithUnit"))):
-        for pat, kind in _UNIT_KIND:
-            if src and re.search(pat, src):
-                return kind
-    if r.get("dataAttributeEnumValues") or re.search(_STATE_DESC, _txt(r.get("description")).lower()):
-        return "Stare"
-    return "Altele"
-
-
-def _unit(text: str) -> str:
-    m = re.search(r"[\d.,]\s*([^\d\s.,][^\d]*)$", text)
-    return m.group(1).strip() if m else ""
-
-
-def _fmt(value: float, unit: str) -> str:
-    dec = 0 if unit in ("W", "VA", "%") else 2 if unit == "V" else 1
-    return f"{value:.{dec}f}" + (f" {unit}" if unit else "")
-
-
-def _find(recs: list[dict], paths: list[str], descs: list[str]) -> list[dict]:
-    hits = [r for r in recs if any(re.search(p, _txt(r.get("dbusPath"))) for p in paths)]
-    if not hits and descs:
-        hits = [r for r in recs if any(re.search(p, _txt(r.get("description")).lower()) for p in descs)]
-    return hits
-
-
-def headline(category: str, recs: list[dict]) -> dict:
-    """{eticheta: {"text": valoare formatată, "value": float|None}} pentru mărimile găsite."""
-    out: dict = {}
-    for label, paths, descs, mode in HEADLINES.get(category, []):
-        hits = _find(recs, paths, descs)
-        if not hits:
-            continue
-        nums = [V._num(r.get("rawValue")) for r in hits]
-        if mode == "sum" and len(hits) > 1 and all(n is not None for n in nums):
-            v = sum(nums)
-            out[label] = {"text": _fmt(v, _unit(_txt(hits[0].get("formattedValue")))), "value": v}
-        elif mode == "join" and len(hits) > 1:
-            out[label] = {"text": " / ".join(_txt(r.get("formattedValue")) for r in hits),
-                          "value": None}
-        else:
-            out[label] = {"text": _txt(hits[0].get("formattedValue")) or _txt(hits[0].get("rawValue")),
-                          "value": nums[0]}
-    return out
-
-
-def _overview_index(overview: list[dict] | None) -> dict:
-    idx: dict = {}
-    for d in overview or []:
-        inst = d.get("instance")
-        for n in (d.get("name"), d.get("productName"), d.get("customName")):
-            if n and inst is not None:
-                idx.setdefault((_txt(n).lower(), str(inst)), d)
-    return idx
-
-
-def group_devices(records: list[dict], overview: list[dict] | None = None,
-                  stale_s: int = 1800) -> list[dict]:
-    """Dispozitivele din /diagnostics, fiecare cu categorie, nume, vechimea datelor și valori."""
-    groups: dict = {}
-    for r in records:
-        dev = _txt(r.get("Device") or r.get("device")) or "Dispozitiv necunoscut"
-        groups.setdefault((dev, _txt(r.get("instance"))), []).append(r)
-    all_ts = [r.get("timestamp") for r in records if isinstance(r.get("timestamp"), (int, float))]
-    newest = max(all_ts) if all_ts else None
-    ov = _overview_index(overview)
-
-    out = []
-    for (dev, inst), recs in groups.items():
-        service = next((_txt(r.get("dbusServiceType")) for r in recs if r.get("dbusServiceType")), "")
-        cat = device_category(service, dev)
-        tss = [r.get("timestamp") for r in recs if isinstance(r.get("timestamp"), (int, float))]
-        ts = max(tss) if tss else None
-        info = ov.get((dev.lower(), inst), {})
-        # nume personalizat: din system-overview sau din atributele /CustomName, /ProductName
-        own = {p: _txt(r.get("formattedValue")) for r in recs
-               for p in ("/CustomName", "/ProductName") if _txt(r.get("dbusPath")).endswith(p)}
-        custom = _txt(info.get("customName")) or own.get("/CustomName", "")
-        product = _txt(info.get("productName")) or own.get("/ProductName", "")
-        out.append({
-            "key": f"{dev}|{inst}",
-            "device": dev,
-            "instance": inst,
-            "service": service,
-            "category": cat,
-            "name": custom or product or dev,
-            "product": product if product and product != (custom or dev) else "",
-            "firmware": _txt(info.get("firmwareVersion")),
-            "ts": ts,
-            "stale": bool(ts and newest and ts < newest - stale_s),
-            "headline": headline(cat, recs),
-            "records": recs,
-        })
-    out.sort(key=lambda d: (CATEGORY_ORDER.index(d["category"]), d["name"].lower(),
-                            int(d["instance"]) if d["instance"].isdigit() else 10**9, d["instance"]))
-    return out
-
-
-def device_table(recs: list[dict], now: float | None = None) -> pd.DataFrame:
-    """Toate mărimile unui dispozitiv, ordonate pe tip (stare, putere, tensiune, curent…)."""
-    now = time.time() if now is None else now
-    rows = []
-    for r in recs:
-        t = r.get("timestamp")
-        rows.append({
-            "Mărime": value_kind(r),
-            "Descriere": _txt(r.get("description")),
-            "Valoare": _txt(r.get("formattedValue")) or _txt(r.get("rawValue")),
-            "Cale D-Bus": _txt(r.get("dbusPath")),
-            "Cod": _txt(r.get("code")),
-            "Vechime (min)": round((now - t) / 60, 1) if isinstance(t, (int, float)) else None,
-        })
-    df = pd.DataFrame(rows, columns=["Mărime", "Descriere", "Valoare", "Cale D-Bus", "Cod",
-                                     "Vechime (min)"])
-    if df.empty:
-        return df
-    df["_o"] = df["Mărime"].map({k: i for i, k in enumerate(KIND_ORDER)})
-    return df.sort_values(["_o", "Descriere"]).drop(columns="_o").reset_index(drop=True)
-
-
-CAT_LABEL = {"inverter": "🔌 Invertoare", "mppt": "☀️ MPPT", "battery": "🔋 Baterii",
-             "other": "🧩 Altele"}
-CAT_SHORT = {"inverter": "invertoare", "mppt": "MPPT", "battery": "baterii", "other": "altele"}
-
-
-def _age(ts, now) -> str:
-    if not ts:
-        return "—"
-    s = max(0, now - ts)
-    if s < 90:
-        return f"acum {s:.0f} s"
-    if s < 5400:
-        return f"acum {s / 60:.0f} min"
-    if s < 172800:
-        return f"acum {s / 3600:.1f} h"
-    return f"acum {s / 86400:.0f} zile"
-
-
-def _tz(inst: dict) -> str:
-    tz = inst.get("timezone") or "Europe/Bucharest"
-    try:
-        ZoneInfo(tz)
-    except Exception:
-        tz = "Europe/Bucharest"
-    return tz
-
-
-def _matches(d: dict, q: str) -> list[dict]:
-    """Înregistrările unui dispozitiv care conțin textul căutat (descriere, cale, cod sau nume)."""
-    if not q:
-        return d["records"]
-    if q in d["name"].lower() or q in d["device"].lower():
-        return d["records"]
-    return [r for r in d["records"]
-            if any(q in str(r.get(k) or "").lower() for k in ("description", "dbusPath", "code"))]
-
-
-# ---------------------------------------------------------------- fiecare Quattro (MQTT VRM)
-# Diagnosticul VRM are un singur „VE.Bus System”; datele pe fiecare unitate din sistemul paralel/trifazat
-# le publică GX-ul doar pe MQTT (N/<portal>/vebus/<inst>/Devices/<n>/...). Le citim din brokerul MQTT
-# al VRM, cu emailul contului (VRM_EMAIL) și același token. Pe GX: Setări → Servicii → MQTT pornit.
-# Documentație: github.com/victronenergy/dbus-flashmq (secțiunea „Connecting to the VRM MQTT servers”).
-VENUS_CA = """-----BEGIN CERTIFICATE-----
-MIIECTCCAvGgAwIBAgIJAM+t3iC8ybEHMA0GCSqGSIb3DQEBCwUAMIGZMQswCQYD
-VQQGEwJOTDESMBAGA1UECAwJR3JvbmluZ2VuMRIwEAYDVQQHDAlHcm9uaW5nZW4x
-HDAaBgNVBAoME1ZpY3Ryb24gRW5lcmd5IEIuVi4xIzAhBgNVBAsMGkNDR1ggQ2Vy
-dGlmaWNhdGUgQXV0aG9yaXR5MR8wHQYJKoZIhvcNAQkBFhBzeXNhZG1pbkB5dGVj
-Lm5sMCAXDTE0MDkxNzExNTQxOVoYDzIxMTQwODI0MTE1NDE5WjCBmTELMAkGA1UE
-BhMCTkwxEjAQBgNVBAgMCUdyb25pbmdlbjESMBAGA1UEBwwJR3JvbmluZ2VuMRww
-GgYDVQQKDBNWaWN0cm9uIEVuZXJneSBCLlYuMSMwIQYDVQQLDBpDQ0dYIENlcnRp
-ZmljYXRlIEF1dGhvcml0eTEfMB0GCSqGSIb3DQEJARYQc3lzYWRtaW5AeXRlYy5u
-bDCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAKVdbAUAElbX+Sh0FATX
-yhlJ6zqYMHbqCXawgsOe09zHynDCT4GTXuSuoH2kR/1jE8zvWNLHORXa/eahzWJP
-V4WpXuYsFEyU3r8hxA6y+SR06IT7WHdfN6LXN+qt5KLQbmQLxeb1zElMKW4io/WE
-N+SWpo5dklXAS6vnq+VRTNwRYnPOUIXKduhvTQp6hEHnLBjYC/Ot8SkC8KtL88cW
-pH6d7UmeW3333/vNMEMOTLWlOWrR30P6R+gTjbvzasaB6tlcYqW+jO1YDlBwhSEV
-4As4ziQysuy4qvm41KY/o4Q6P6npsh8MaZuRmi/UTxU2DHAbs/on7qaRi6IkVgvg
-o6kCAwEAAaNQME4wHQYDVR0OBBYEFPjmM5NYXMw7Wc/TgbLtwPnMAfewMB8GA1Ud
-IwQYMBaAFPjmM5NYXMw7Wc/TgbLtwPnMAfewMAwGA1UdEwQFMAMBAf8wDQYJKoZI
-hvcNAQELBQADggEBAEFTeGcmxzzXJIfgUrfKLki+hi2mR9g7qomvw6IB1JQHefIw
-iKXe14gdp0ytjYL6QoTeEbS2A8VI2FvSbusAzn0JqXdZI+Gwt/CuH0XH40QHpaQ5
-UAB5d7EGvbB2op7AA/IyR5TwF/cDb1fRbTaTmwDOIo3kuFGEyNCc+PFrN2MvtPHn
-hHH7fo7joY7mUKdP573bJXFsLwZxlqiycJreroLPFqYwgChaMTStQ71rP5i1eGtg
-ealQ7kPVtlHmX89tCkfkK77ojm48qgl4gwsI01SikstaPP9fr4ck+U/qIKhSg+Bg
-nc9OImY9ubQxe+/GQP4KFme2PPqthEWys7ut2HM=
------END CERTIFICATE-----
-"""
-
-
-def mqtt_host(inst: dict) -> str:
-    """Brokerul VRM al instalației: mqtt<suma ord(caractere ID portal) % 128>.victronenergy.com."""
-    if inst.get("mqtt_host"):
-        return str(inst["mqtt_host"])
-    pid = str(inst.get("identifier", "")).lower().strip()
-    return f"mqtt{sum(ord(c) for c in pid) % 128}.victronenergy.com"
-
-
-@st.cache_data(ttl=30, show_spinner=False)
-def vebus_units_raw(portal_id: str, host: str, email: str, wait_s: float = 8.0) -> dict:
-    """Citește o dată toate topicurile N/<portal>/vebus/# (keep-alive -> GX-ul republică tot)."""
-    import json
-    import ssl
-    import threading
-    import uuid
-
-    import paho.mqtt.client as mqtt
-
-    values: dict = {}
-    state = {"error": None}
-    done = threading.Event()
-    connected = threading.Event()
-
-    def on_connect(c, userdata, flags, rc, properties=None):
-        if rc.is_failure:
-            state["error"] = f"conectare refuzată de broker: {rc}"
-            done.set()
-            return
-        connected.set()
-        c.subscribe([(f"N/{portal_id}/vebus/#", 0), (f"N/{portal_id}/full_publish_completed", 0)])
-        c.publish(f"R/{portal_id}/keepalive", "")
-
-    def on_message(c, userdata, msg):
-        if msg.topic.endswith("/full_publish_completed"):
-            done.set()
-            return
-        try:
-            values[msg.topic] = json.loads(msg.payload or b"null")
-        except ValueError:
-            values[msg.topic] = {"value": msg.payload.decode(errors="replace")}
-
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"vrmdash_{uuid.uuid4().hex[:12]}")
-    client.username_pw_set(email, f"Token {st.secrets['VRM_TOKEN']}")
-    ctx = ssl.create_default_context(cadata=VENUS_CA)
-    # Python 3.13+ respinge implicit CA-ul Victron (Basic Constraints nemarcat „critical”);
-    # oprim doar regula strictă, certificatul și numele serverului rămân verificate
-    ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
-    client.tls_set_context(ctx)
-    client.on_connect, client.on_message = on_connect, on_message
-    try:
-        client.connect(host, 8883, keepalive=30)
-    except Exception as e:                       # DNS, rețea, TLS
-        return {"values": {}, "error": f"nu pot contacta {host}: {e}", "complete": False}
-    client.loop_start()
-    try:
-        done.wait(wait_s)
-    finally:
-        client.loop_stop()
-        client.disconnect()
-    err = state["error"] or (None if connected.is_set() else f"fără răspuns de la {host}")
-    return {"values": values, "error": err, "complete": done.is_set() and not state["error"]}
-
-
-PHASE_COLORS = {"L1": "#C8553D", "L2": "#3D405B", "L3": "#5B9279", "—": "#8A8A8A"}
-
-
-def vebus_parse(values: dict, portal_id: str) -> dict:
-    """{instanța VE.Bus: {"units": {n: {cale: valoare}}, "sys": {cale: valoare}}} din topicurile MQTT."""
-    pat = re.compile(rf"^N/{re.escape(portal_id)}/vebus/(\d+)/(.+)$")
-    out: dict = {}
-    for topic, payload in values.items():
-        m = pat.match(topic)
-        if not m:
-            continue
-        v = payload.get("value") if isinstance(payload, dict) else payload
-        if v is None or isinstance(v, (list, dict)):
-            continue
-        inst, path = m.groups()
-        d = out.setdefault(inst, {"units": {}, "sys": {}})
-        u = re.match(r"^Devices/(\d+)/(.+)$", path)
-        if u:
-            d["units"].setdefault(int(u.group(1)), {})[u.group(2)] = v
-        else:
-            d["sys"][path] = v
-    return {k: v for k, v in out.items() if v["units"]}
-
-
-def _f(x):
-    try:
-        return float(x)
-    except (TypeError, ValueError):
-        return None
-
-
-def unit_phases(n_units: int, sys: dict) -> list[str]:
-    """Faza fiecărei unități, după ordinea în care le numerotează GX-ul: L1, L2, L3, L1, L2, L3…"""
-    phases = int(_f(sys.get("Ac/NumberOfPhases")) or 0) or \
-        len([p for p in ("L1", "L2", "L3") if f"Ac/Out/{p}/P" in sys]) or 1
-    if phases == 1:
-        return ["L1"] * n_units
-    if n_units % phases:
-        return ["—"] * n_units
-    return [f"L{i % phases + 1}" for i in range(n_units)]
-
-
-def units_frame(d: dict) -> pd.DataFrame:
-    """Un rând pe Quattro, ordonat pe faze, cu mărimile utile."""
-    idx = sorted(d["units"])
-    phases = unit_phases(len(idx), d["sys"])
-    nph = max(1, len(set(phases) - {"—"}))
-    rows = []
-    for k, (n, ph) in enumerate(zip(idx, phases)):
-        u = d["units"][n]
-        p_in, p_out, p_bat = _f(u.get("Ac/In/P")), _f(u.get("Ac/Out/P")), _f(u.get("Ac/Inverter/P"))
-        ubat = _f(u.get("Diagnostics/UBatTerminal"))
-        rows.append({
-            "Quattro": f"{ph} / {k // nph + 1}" if ph != "—" else f"Unitatea {k + 1}",
-            "Fază": ph,
-            "Serie": str(u.get("SerialNumber") or ""),
-            "Intrare AC (W)": p_in,
-            "Ieșire AC (W)": p_out,
-            "Spre baterie (W)": p_bat,
-            "Tensiune baterie (V)": ubat,
-            # curent DC estimat din puterea spre baterie (fără pierderile de conversie)
-            "Curent baterie ≈ (A)": round(p_bat / ubat, 1) if p_bat is not None and ubat else None,
-        })
-    df = pd.DataFrame(rows)
-    order = {"L1": 0, "L2": 1, "L3": 2}
-    df["_o"] = df["Fază"].map(order).fillna(9)
-    return df.sort_values(["_o"], kind="stable").drop(columns="_o").reset_index(drop=True)
-
-
-def _full_height(rows: int) -> int:
-    """Înălțimea unui st.dataframe care arată toate rândurile, fără derulare internă."""
-    return 38 + 35 * rows
-
-
-def phase_frame(sys: dict) -> pd.DataFrame:
-    """Valorile sistemului pe fiecare fază (intrare activă și ieșire)."""
-    rows = []
-    for p in ("L1", "L2", "L3"):
-        r = {"Fază": p}
-        for side, base in (("Intrare", "Ac/ActiveIn"), ("Ieșire", "Ac/Out")):
-            for leaf, label in (("V", "V"), ("I", "A"), ("P", "W"), ("F", "Hz")):
-                r[f"{side} ({label})"] = _f(sys.get(f"{base}/{p}/{leaf}"))
-        if any(v is not None for k, v in r.items() if k != "Fază"):
-            rows.append(r)
-    df = pd.DataFrame(rows)
-    return df.dropna(axis=1, how="all") if not df.empty else df
-
-
-def check_phases(df: pd.DataFrame, sys: dict) -> list[str]:
-    """Verifică ordinea L1/L2/L3: suma unităților pe fază ≈ puterea fazei raportată de sistem."""
-    bad = []
-    for p, g in df.groupby("Fază"):
-        ref = _f(sys.get(f"Ac/Out/{p}/P"))
-        s = g["Ieșire AC (W)"].sum(min_count=1)
-        if ref is not None and pd.notna(s) and abs(s - ref) > max(300, 0.15 * abs(ref)):
-            bad.append(f"{p}: unitățile însumează {s:.0f} W, faza raportează {ref:.0f} W")
-    return bad
-
-
-def vebus_units_section(site: int):
-    st.markdown("#### Fiecare Quattro")
-    inst = next((i for i in installations() if i["idSite"] == site), {})
-    email = find_secret("VRM_EMAIL")
-    if not email:
-        st.info("Pentru datele pe fiecare Quattro, adaugă în Secrets linia "
-                "`VRM_EMAIL = \"emailul contului VRM\"` (deasupra primei linii care începe cu `[`).")
-        return
-    pid = str(inst.get("identifier", "")).strip()
-    if not pid:
-        st.warning("VRM nu a întors ID-ul de portal al acestui sistem.")
-        return
-    try:
-        res = vebus_units_raw(pid, mqtt_host(inst), str(email))
-    except ModuleNotFoundError:
-        st.error("Lipsește biblioteca paho-mqtt: adaug-o în requirements.txt.")
-        return
-    systems = vebus_parse(res["values"], pid)
-    if res["error"] and not systems:
-        st.warning(f"MQTT VRM: {res['error']}. Verifică VRM_EMAIL (același cont ca token-ul) și, pe GX, "
-                   "Setări → Servicii → MQTT pornit.")
-        return
-    if not systems:
-        st.info("GX-ul nu a publicat date pe unități (Devices/…) pentru VE.Bus. Verifică pe GX: "
-                "Setări → Servicii → MQTT pornit.")
-        return
-
-    for vb, d in systems.items():
-        if len(systems) > 1:
-            st.caption(f"Sistem VE.Bus, instanța {vb}")
-        sys = d["sys"]
-        df = units_frame(d)
-
-        # bateria, așa cum o vede sistemul VE.Bus
-        bat = [("SOC baterie", sys.get("Soc"), "%", 0), ("Tensiune baterie", sys.get("Dc/0/Voltage"), "V", 2),
-               ("Curent baterie", sys.get("Dc/0/Current"), "A", 1), ("Putere baterie", sys.get("Dc/0/Power"), "W", 0)]
-        bat = [(lbl, _f(v), u, dec) for lbl, v, u, dec in bat if _f(v) is not None]
-        if bat:
-            for col, (lbl, v, u, dec) in zip(st.columns(len(bat)), bat):
-                col.metric(lbl, f"{v:.{dec}f} {u}")
-
-        ph = phase_frame(sys)
-        if not ph.empty:
-            st.markdown("**Pe faze**")
-            st.dataframe(ph, hide_index=True, use_container_width=True, height=_full_height(len(ph)),
-                         column_config={c: st.column_config.NumberColumn(
-                             c, format="%.0f" if c.endswith("(W)") else "%.1f" if "(A)" in c
-                             else "%.2f" if "(Hz)" in c else "%.1f") for c in ph.columns if c != "Fază"})
-
-        st.markdown("**Pe fiecare Quattro**")
-        # scală fixă: cât de încărcat e fiecare aparat față de puterea nominală (QUATTRO_MAX_W, implicit 15 000 W)
-        pmax = float(find_secret("QUATTRO_MAX_W", 15000) or 15000)
-        bar_kw = dict(format="%.0f W", min_value=0, max_value=pmax,
-                      help=f"Bara: încărcarea față de {pmax:.0f} W pe aparat")
-        try:
-            bar = st.column_config.ProgressColumn("Ieșire AC (W)", color="#3B7DD8", **bar_kw)
-        except TypeError:                     # Streamlit mai vechi, fără parametrul color
-            bar = st.column_config.ProgressColumn("Ieșire AC (W)", **bar_kw)
-        tot = {"Quattro": "TOTAL", "Fază": "", "Serie": "",
-               "Intrare AC (W)": df["Intrare AC (W)"].sum(min_count=1),
-               "Ieșire AC (W)": df["Ieșire AC (W)"].sum(min_count=1),
-               "Spre baterie (W)": df["Spre baterie (W)"].sum(min_count=1),
-               "Tensiune baterie (V)": None,
-               "Curent baterie ≈ (A)": df["Curent baterie ≈ (A)"].sum(min_count=1)}
-        shown = df.drop(columns=["Serie"] if not df["Serie"].str.len().any() else [])
-        st.dataframe(
-            shown, hide_index=True, use_container_width=True, height=_full_height(len(shown)),
-            column_config={
-                "Ieșire AC (W)": bar,
-                "Intrare AC (W)": st.column_config.NumberColumn(format="%.0f"),
-                "Spre baterie (W)": st.column_config.NumberColumn(
-                    format="%.0f", help="Intrare − ieșire: + se încarcă bateria, − se descarcă"),
-                "Tensiune baterie (V)": st.column_config.NumberColumn(format="%.2f",
-                                                                      help="La bornele unității"),
-                "Curent baterie ≈ (A)": st.column_config.NumberColumn(
-                    format="%.1f", help="Estimat: putere spre baterie ÷ tensiune (fără pierderi)"),
-            })
-        t = pd.DataFrame([tot])[[c for c in shown.columns]]
-        st.dataframe(t, hide_index=True, use_container_width=True,
-                     column_config={c: st.column_config.NumberColumn(format="%.0f")
-                                    for c in ("Intrare AC (W)", "Ieșire AC (W)", "Spre baterie (W)")} |
-                     {"Curent baterie ≈ (A)": st.column_config.NumberColumn(format="%.1f")})
-
-        num = pd.to_numeric(df["Ieșire AC (W)"], errors="coerce")
-        if num.notna().any():
-            fig = go.Figure()
-            for p in df["Fază"].unique():
-                g = df[df["Fază"] == p]
-                fig.add_bar(name=p, x=g["Quattro"], y=g["Ieșire AC (W)"],
-                            marker_color=PHASE_COLORS.get(p, "#8A8A8A"), hovertemplate="%{y:.0f} W")
-            fig.update_layout(title="Putere ieșire AC pe fiecare Quattro", height=320, yaxis_title="W",
-                              legend=dict(orientation="h", y=-0.2), margin=dict(l=10, r=10, t=40, b=10))
-            st.plotly_chart(fig, use_container_width=True, key=f"vbu_{site}_{vb}")
-
-        for msg in check_phases(df, sys):
-            st.warning("Ordinea L1/L2/L3 pare să nu se potrivească – " + msg)
-        if "—" in set(df["Fază"]):
-            st.caption("Faza unităților nu a putut fi dedusă (număr de unități nedivizibil cu numărul de faze).")
-
-    st.caption("Sursa: MQTT VRM (" + ("toate topicurile primite" if res["complete"] else
-               "răspuns parțial, se completează la următoarea reîmprospătare") + "). Faza unităților e dedusă "
-               "din ordinea GX: L1, L2, L3, L1, L2, L3…")
-
-
-def _device_card(d: dict, recs: list[dict], now: float, tz: str, expand: bool):
-    with st.container(border=True):
-        badge = " · ⚠️ date vechi" if d["stale"] else ""
-        st.markdown(f"**{d['name']}**  ·  instanța {d['instance'] or '—'}{badge}")
-        bits = [d["device"]] if d["name"] != d["device"] else []
-        bits += [b for b in (d["product"], d["firmware"] and f"firmware {d['firmware']}") if b]
-        if d["ts"]:
-            loc = datetime.fromtimestamp(d["ts"], ZoneInfo(tz))
-            bits.append(f"actualizat {loc:%d.%m %H:%M:%S} ({_age(d['ts'], now)})")
-        st.caption(" · ".join(bits))
-        head = list(d["headline"].items())
-        for i in range(0, len(head), 4):
-            cols = st.columns(4)
-            for col, (label, v) in zip(cols, head[i:i + 4]):
-                col.metric(label, v["text"] or "—")
-        with st.expander(f"Toate valorile ({len(recs)})", expanded=expand):
-            st.dataframe(device_table(recs, now), use_container_width=True, hide_index=True,
-                         column_config={"Vechime (min)": st.column_config.NumberColumn(format="%.1f")})
-
-
-def _summary(devs: list[dict], now: float) -> pd.DataFrame:
-    """Un rând pe dispozitiv, cu mărimile principale – bun pentru comparat MPPT-uri între ele."""
-    rows = []
-    for d in devs:
-        row = {"Dispozitiv": d["name"], "Instanța": d["instance"]}
-        row.update({k: v["text"] for k, v in d["headline"].items()})
-        row["Actualizat"] = _age(d["ts"], now) + (" ⚠️" if d["stale"] else "")
-        rows.append(row)
-    return pd.DataFrame(rows)
-
-
-def _site_body(site: int, name: str, tz: str, get_diag, get_overview, query: str):
-    now = time.time()
-    try:
-        records = get_diag(site)
-    except V.VRMError as e:
-        st.warning(f"Date indisponibile pentru {name}: {e}")
-        return
-    try:
-        overview = get_overview(site)
-    except V.VRMError:
-        overview = []                     # doar etichete; pagina merge și fără
-    devs = group_devices(records, overview)
-    if not devs:
-        st.info("VRM nu a întors date de diagnostic pentru acest sistem.")
-        return
-
-    tss = [d["ts"] for d in devs if d["ts"]]
-    newest = max(tss) if tss else None
-    if newest is None or newest < now - 7200:
-        st.warning("⚠️ Sistemul nu a mai trimis date în ultimele 2 ore (GX offline?). "
-                   "Valorile de mai jos sunt ultimele primite de VRM.")
-    else:
-        st.caption(f"Ultimele date VRM: {datetime.fromtimestamp(newest, ZoneInfo(tz)):%d.%m.%Y %H:%M:%S}"
-                   f" ({_age(newest, now)}) · {len(records)} mărimi")
-
-    by_cat = {c: [d for d in devs if d["category"] == c] for c in CATEGORY_ORDER}
-    cats = [c for c in CATEGORY_ORDER if by_cat[c]]
-    st.caption(" · ".join(f"{len(by_cat[c])} {CAT_SHORT[c]}" for c in cats))
-    cat = st.radio("Categorie", cats, horizontal=True, key=f"devcat_{site}",
-                   format_func=lambda c: f"{CAT_LABEL[c]} ({len(by_cat[c])})",
-                   label_visibility="collapsed")
-    shown = [(d, _matches(d, query)) for d in by_cat.get(cat, [])]
-    shown = [(d, recs) for d, recs in shown if recs]
-    if not shown:
-        st.info("Niciun dispozitiv nu conține textul căutat." if query else "Niciun dispozitiv.")
-        return
-
-    # totaluri utile pe categorie (doar din dispozitive cu date recente)
-    fresh = [d for d, _ in shown if not d["stale"]]
-    tot = {"mppt": [("Putere PV totală MPPT", "Putere PV", "W")],
-           "inverter": [("Putere ieșire AC totală", "Putere ieșire AC", "W")],
-           "battery": [("Curent total baterii", "Curent", "A")]}.get(cat, [])
-    for label, key, unit in tot:
-        vals = [d["headline"][key]["value"] for d in fresh
-                if key in d["headline"] and d["headline"][key]["value"] is not None]
-        if len(vals) > 1:
-            st.metric(label, f"{sum(vals):.0f} {unit}" if unit == "W" else f"{sum(vals):.1f} {unit}")
-
-    if len(shown) > 1:
-        st.dataframe(_summary([d for d, _ in shown], now), use_container_width=True, hide_index=True)
-    for d, recs in shown:
-        _device_card(d, recs, now, tz, expand=bool(query))
-    if cat == "inverter" and not query:
-        vebus_units_section(site)
-
-    csv = pd.concat([device_table(d["records"], now).assign(Dispozitiv=d["name"],
-                                                               Instanța=d["instance"])
-                     for d in devs], ignore_index=True)
-    st.download_button("⬇️ Toate mărimile (CSV)", csv.to_csv(sep=";", index=False).encode("utf-8-sig"),
-                       file_name=f"dispozitive_{site}_{datetime.now(ZoneInfo(tz)):%Y%m%d_%H%M}.csv",
-                       mime="text/csv", key=f"devcsv_{site}")
-
-
-def devices_page(insts: list[dict], default_sites: list, get_diag, get_overview, refresh_s: int):
-    names = {i["idSite"]: i.get("name") or f"Instalația {i['idSite']}" for i in insts}
-    with st.sidebar:
-        default = [s for s in default_sites if s in names] or list(names)
-        sites = st.multiselect("Sisteme", list(names), default=default, format_func=names.get,
-                               key="dev_sites")
-        auto = st.toggle(f"Reîmprospătare automată ({refresh_s} s)", value=True, key="dev_auto")
-        if st.button("🔄 Citește acum din VRM", use_container_width=True):
-            for f in (get_diag, get_overview):
-                if hasattr(f, "clear"):
-                    f.clear()
-            st.rerun()
-
-    st.title("🔧 Dispozitive")
-    st.caption("Valorile instantanee pe fiecare invertor, MPPT și baterie, din diagnosticul VRM. "
-               "Prospețimea lor depinde de intervalul de raportare al GX-ului către VRM.")
-    query = st.text_input("Caută o mărime (descriere, cale D-Bus, cod sau nume dispozitiv)",
-                          key="dev_q", placeholder="ex.: temperature, /Pv/V, cell").strip().lower()
-    if not sites:
-        st.info("Alege cel puțin un sistem din bara laterală.")
-        return
-
-    for site in sites:
-        inst = next(i for i in insts if i["idSite"] == site)
-        st.header(names[site])
-        body = st.fragment(run_every=refresh_s if auto else None)(_site_body)
-        body(site, names[site], _tz(inst), get_diag, get_overview, query)
-
-
 # ================================================================ PAGINA
 user = login_gate()
 is_admin = user["role"] == "admin"
@@ -970,30 +286,10 @@ with st.sidebar:
     if st.button("Ieșire", use_container_width=True):
         st.session_state.pop("user", None)
         st.rerun()
-    # al doilea dashboard („Dispozitive”) – doar admin; pentru oaspeți ?pagina= e ignorat
-    pagina = st.query_params.get("pagina", "") if is_admin else ""
-    if is_admin:
-        c1, c2 = st.columns(2)
-        if c1.button("☀️ Dashboard", use_container_width=True,
-                     type="secondary" if pagina == "dispozitive" else "primary"):
-            st.query_params.pop("pagina", None)
-            st.rerun()
-        if c2.button("🔧 Dispozitive", use_container_width=True,
-                     type="primary" if pagina == "dispozitive" else "secondary"):
-            st.query_params["pagina"] = "dispozitive"
-            st.rerun()
     st.divider()
     names = {i["idSite"]: i.get("name") or f"Instalația {i['idSite']}" for i in insts}
     if is_admin:
         st.caption("ID-uri pentru `sites`: " + ", ".join(f"{n} = {k}" for k, n in names.items()))
-
-if is_admin and pagina == "dispozitive":
-    _wanted = {str(x).strip().lower() for x in (find_secret("TOTAL_SITES") or [])}
-    devices_page(insts, [k for k in names if str(k) in _wanted or names[k].strip().lower() in _wanted],
-                 diagnostics, system_overview, int(secret("REFRESH_SECONDS", 60)))
-    st.stop()
-
-with st.sidebar:
     hide = list(user["hide"])
     total_view = False          # True = vederea „total”, sub care apar sistemele EXTRA
     if user.get("combined") and len(insts) > 1:
@@ -1097,6 +393,16 @@ def live_panel(sec_sites, sec_hide, tz, key, soc_site=None):
     st.caption(stamp, help=f"Se reîmprospătează automat la {REFRESH} s.")
 
 
+def battery_kwh(site):
+    """Capacitatea utilă a bateriilor (kWh) din Secrets: [battery_kwh] "ID" sau "nume" = valoare."""
+    tbl = find_secret("battery_kwh") or {}
+    try:
+        tbl = {_norm(k): float(v) for k, v in dict(tbl).items()}
+    except (TypeError, ValueError):
+        return None
+    return tbl.get(_norm(site)) or tbl.get(_norm(all_names.get(site, "")))
+
+
 def render_section(sec_sites, sec_title, sec_hide, key, show_diag=False, soc_site=None):
     """Un dashboard complet (flux live + KPI + tabele) pentru unul sau mai multe sisteme."""
     tz = site_tz(sec_sites)
@@ -1159,9 +465,24 @@ def render_section(sec_sites, sec_title, sec_hide, key, show_diag=False, soc_sit
         m = b.selectbox("Lună", months, format_func=lambda k: LUNI[k - 1], key=f"d_m_{key}")
         sel = daily[(idx.year == y) & (idx.month == m)]
         table = V.with_total(sel, [d.strftime("%d.%m.%Y") for d in sel.index])
-        if soc_site:
-            soc = soc_month(soc_site, y, m, tz)
-            table[V.SOC_COL] = [soc.get(d) for d in sel.index] + [None]   # rândul TOTAL rămâne gol
+        # energie disponibilă la sfârșitul zilei = Σ (SOC% × capacitate) pe fiecare sistem
+        # care are capacitate în [battery_kwh]; dacă niciunul nu are, se folosește SOC_SITE
+        caps = {s: battery_kwh(s) for s in sec_sites}
+        caps = {s: c for s, c in caps.items() if c}
+        if not caps and soc_site and battery_kwh(soc_site):
+            caps = {soc_site: battery_kwh(soc_site)}
+        if caps:
+            socs = {s: soc_month(s, y, m, tz) for s in caps}
+            vals = []
+            for d in sel.index:
+                parts = [socs[s].get(d) for s in caps]
+                vals.append(None if any(p is None for p in parts) else
+                            round(sum(p / 100 * caps[s] for p, s in zip(parts, caps)), 1))
+            table[V.ENERGY_COL] = vals + [None]   # rândul TOTAL rămâne gol
+        elif soc_site and is_admin:
+            st.caption(f"Pentru coloana „{V.ENERGY_COL}”, adaugă în Secrets la [battery_kwh] "
+                       f"capacitatea bateriilor sistemului {all_names.get(soc_site, soc_site)} "
+                       f"(ID {soc_site}), de ex.: \"{soc_site}\" = 30")
         energy_chart(table.rename(index=lambda s: s[:5]), f"{LUNI[m - 1]} {y}", key=f"c_d_{key}")
         energy_table(table, f"energie_zilnic{fn}_{y}-{m:02d}.csv", key=f"dl_d_{key}")
 
@@ -1207,11 +528,19 @@ def render_section(sec_sites, sec_title, sec_hide, key, show_diag=False, soc_sit
                          use_container_width=True, hide_index=True)
 
 
+def _norm(x) -> str:
+    """Comparare tolerantă: fără diacritice, fără spații multiple, litere mici."""
+    import unicodedata
+    s = unicodedata.normalize("NFKD", str(x))
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return " ".join(s.replace("\u00a0", " ").split()).lower()
+
+
 def resolve_sites(keys) -> list:
-    """ID-uri sau nume exacte -> idSite din contul VRM."""
-    wanted = {str(x).strip().lower() for x in keys}
+    """ID-uri sau nume -> idSite din contul VRM (nume comparate tolerant)."""
+    wanted = {_norm(x) for x in keys if x not in (None, "")}
     return [i["idSite"] for i in all_insts
-            if str(i["idSite"]) in wanted or str(i.get("name", "")).strip().lower() in wanted]
+            if str(i["idSite"]) in wanted or _norm(i.get("name", "")) in wanted]
 
 
 # ---------------------------------------------------------------- PAGINA
@@ -1220,9 +549,13 @@ def resolve_sites(keys) -> list:
 if len(sites) == 1:
     main_soc = sites[0]
 else:
-    cand = resolve_sites([find_secret("SOC_SITE")]) if find_secret("SOC_SITE") else []
-    cand = [c for c in cand if c in sites] or \
-        [s for s in sites if "ekrano" in all_names.get(s, "").lower()]
+    soc_key = find_secret("SOC_SITE")
+    cand = [c for c in (resolve_sites([soc_key]) if soc_key else []) if c in sites]
+    if soc_key and not cand and is_admin:
+        st.warning(f"SOC_SITE = „{soc_key}” nu se potrivește cu niciun sistem din total. "
+                   "Folosește unul dintre: "
+                   + "; ".join(f"{all_names.get(s, s)} = {s}" for s in sites))
+    cand = cand or [s for s in sites if "ekrano" in all_names.get(s, "").lower()]
     main_soc = cand[0] if cand else None
     if main_soc and "soc" not in user["hide_base"]:
         hide = [h for h in hide if h != "soc"]      # la total arătăm SOC-ul Ekrano în cercul bateriei
